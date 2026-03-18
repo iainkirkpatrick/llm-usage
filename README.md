@@ -15,13 +15,15 @@ cd ~/Development/iainkirkpatrick/llm-usage
 swift run
 ```
 
-Installed app (via dotfiles):
+Installed app (via dotfiles, using GitHub Releases):
 
 ```bash
 cd ~/Development/iainkirkpatrick/dotfiles
 ./install-assistant-apps.sh
 open "$HOME/Applications/LLM Usage.app"
 ```
+
+The dotfiles installer downloads the latest public GitHub release by default. If that fails, it falls back to building from local source when `~/Development/iainkirkpatrick/llm-usage` exists.
 
 ## Config
 

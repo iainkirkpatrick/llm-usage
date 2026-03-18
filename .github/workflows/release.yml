@@ -1,0 +1,29 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Package macOS app
+        run: ./scripts/package-macos-app.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/LLM-Usage-macos.tar.gz
+            dist/LLM-Usage-macos.tar.gz.sha256
+          generate_release_notes: true
+          make_latest: true
