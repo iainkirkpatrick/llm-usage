@@ -20,7 +20,7 @@ Installed app (via dotfiles):
 ```bash
 cd ~/Development/iainkirkpatrick/dotfiles
 ./install-assistant-apps.sh
-open "$HOME/Applications/Assistants/LLM Usage.app"
+open "$HOME/Applications/LLM Usage.app"
 ```
 
 ## Config
