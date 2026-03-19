@@ -13,6 +13,7 @@ struct CodexSnapshot: Sendable {
     let session: RateWindow?
     let weekly: RateWindow?
     let creditsRemaining: Double?
+    let sourceLabel: String
     let updatedAt: Date
 }
 

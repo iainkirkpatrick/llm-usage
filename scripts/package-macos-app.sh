@@ -10,6 +10,12 @@ BUNDLE_NAME="LLMUsageBar_LLMUsageBar.bundle"
 ARCHIVE_NAME="LLM-Usage-macos.tar.gz"
 
 cd "$ROOT_DIR"
+
+if [ -f package.json ]; then
+  npm install
+  npm run build:pi-helper
+fi
+
 swift build -c release
 
 built_bin="$(find "$BUILD_DIR" -type f -name LLMUsageBar -path '*/release/*' | head -n 1)"

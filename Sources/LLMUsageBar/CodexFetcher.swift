@@ -19,8 +19,22 @@ private struct RPCCreditsSnapshot: Decodable {
     let balance: String?
 }
 
+private struct PiCodexAuthHelperResponse: Decodable {
+    let status: String?
+    let accessToken: String?
+    let chatgptAccountId: String?
+    let chatgptPlanType: String?
+}
+
+private struct PiCodexAuthTokens: Sendable {
+    let accessToken: String
+    let chatgptAccountId: String
+    let chatgptPlanType: String?
+}
+
 enum CodexFetchError: LocalizedError {
     case executableNotFound([String])
+    case nodeNotFound([String])
     case launchFailed(String)
     case malformedResponse(String?)
     case noData
@@ -32,6 +46,11 @@ enum CodexFetchError: LocalizedError {
                 return "Codex executable was not found."
             }
             return "Codex executable was not found. Checked: \(candidates.joined(separator: ", "))."
+        case let .nodeNotFound(candidates):
+            if candidates.isEmpty {
+                return "Node.js executable was not found for Pi-backed Codex auth."
+            }
+            return "Node.js executable was not found for Pi-backed Codex auth. Checked: \(candidates.joined(separator: ", "))."
         case let .launchFailed(message):
             return "Could not start codex app-server: \(message)"
         case let .malformedResponse(details):
@@ -45,6 +64,11 @@ enum CodexFetchError: LocalizedError {
     }
 }
 
+private enum PiCodexHelperAvailability: Error {
+    case unavailable
+    case noAuth
+}
+
 private final class CodexRPCClient: @unchecked Sendable {
     private let process = Process()
     private let stdinPipe = Pipe()
@@ -54,6 +78,7 @@ private final class CodexRPCClient: @unchecked Sendable {
     private let continuation: AsyncStream<Data>.Continuation
     private let stderrCollector = DataAccumulator()
     private var nextID: Int = 1
+    private let externalAuthTokenProvider: (@Sendable (_ previousAccountID: String?) async throws -> PiCodexAuthTokens)?
 
     private final class LineBuffer: @unchecked Sendable {
         private let lock = NSLock()
@@ -98,15 +123,14 @@ private final class CodexRPCClient: @unchecked Sendable {
         }
     }
 
-    init() throws {
+    init(
+        codexPath: String,
+        externalAuthTokenProvider: (@Sendable (_ previousAccountID: String?) async throws -> PiCodexAuthTokens)? = nil
+    ) throws {
         var continuation: AsyncStream<Data>.Continuation!
         self.stdoutStream = AsyncStream<Data> { continuation = $0 }
         self.continuation = continuation
-
-        let candidates = Self.codexExecutableCandidates()
-        guard let codexPath = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-            throw CodexFetchError.executableNotFound(candidates)
-        }
+        self.externalAuthTokenProvider = externalAuthTokenProvider
 
         self.process.executableURL = URL(fileURLWithPath: codexPath)
         self.process.arguments = ["-s", "read-only", "-a", "untrusted", "app-server"]
@@ -164,13 +188,38 @@ private final class CodexRPCClient: @unchecked Sendable {
     func initialize() async throws {
         _ = try await self.request(method: "initialize", params: [
             "clientInfo": ["name": "llm-usage-bar", "version": "0.1.0"],
+            "capabilities": ["experimentalApi": true],
         ])
         try self.sendNotification(method: "initialized")
+    }
+
+    func loginWithChatGPTTokens(_ tokens: PiCodexAuthTokens) async throws {
+        var params: [String: Any] = [
+            "type": "chatgptAuthTokens",
+            "accessToken": tokens.accessToken,
+            "chatgptAccountId": tokens.chatgptAccountId,
+        ]
+
+        if let planType = tokens.chatgptPlanType {
+            params["chatgptPlanType"] = planType
+        } else {
+            params["chatgptPlanType"] = NSNull()
+        }
+
+        _ = try await self.request(method: "account/login/start", params: params)
     }
 
     func fetchRateLimits() async throws -> RPCRateLimitSnapshot {
         let response: RPCRateLimitsResponse = try await self.requestAndDecode(method: "account/rateLimits/read")
         return response.rateLimits
+    }
+
+    static func resolvedCodexExecutablePath() throws -> String {
+        let candidates = self.codexExecutableCandidates()
+        guard let codexPath = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            throw CodexFetchError.executableNotFound(candidates)
+        }
+        return codexPath
     }
 
     private static func codexExecutableCandidates() -> [String] {
@@ -222,9 +271,14 @@ private final class CodexRPCClient: @unchecked Sendable {
         while true {
             let message = try await self.readNextMessage()
 
-            if message["id"] == nil {
+            if let method = message["method"] as? String,
+               message["id"] != nil
+            {
+                try await self.handleServerRequest(method: method, message: message)
                 continue
             }
+
+            guard message["id"] != nil else { continue }
 
             let responseID = self.jsonID(message["id"])
             guard responseID == id else { continue }
@@ -239,6 +293,35 @@ private final class CodexRPCClient: @unchecked Sendable {
         }
     }
 
+    private func handleServerRequest(method: String, message: [String: Any]) async throws {
+        guard let requestID = self.jsonID(message["id"]) else { return }
+
+        switch method {
+        case "account/chatgptAuthTokens/refresh":
+            guard let externalAuthTokenProvider else {
+                try self.sendErrorResponse(id: requestID, message: "External auth refresh is not configured.")
+                return
+            }
+
+            let params = message["params"] as? [String: Any]
+            let previousAccountID = params?["previousAccountId"] as? String
+
+            do {
+                let tokens = try await externalAuthTokenProvider(previousAccountID)
+                try self.sendResultResponse(id: requestID, result: [
+                    "accessToken": tokens.accessToken,
+                    "chatgptAccountId": tokens.chatgptAccountId,
+                    "chatgptPlanType": tokens.chatgptPlanType ?? NSNull(),
+                ])
+            } catch {
+                try self.sendErrorResponse(id: requestID, message: error.localizedDescription)
+            }
+
+        default:
+            try self.sendErrorResponse(id: requestID, message: "Unsupported server request: \(method)")
+        }
+    }
+
     private func sendRequest(id: Int, method: String, params: [String: Any]?) throws {
         var payload: [String: Any] = [
             "id": id,
@@ -248,9 +331,7 @@ private final class CodexRPCClient: @unchecked Sendable {
         if payload["params"] == nil {
             payload["params"] = [:]
         }
-        let data = try JSONSerialization.data(withJSONObject: payload)
-        self.stdinPipe.fileHandleForWriting.write(data)
-        self.stdinPipe.fileHandleForWriting.write(Data([0x0A]))
+        try self.sendPayload(payload)
     }
 
     private func sendNotification(method: String) throws {
@@ -258,6 +339,27 @@ private final class CodexRPCClient: @unchecked Sendable {
             "method": method,
             "params": [:],
         ]
+        try self.sendPayload(payload)
+    }
+
+    private func sendResultResponse(id: Int, result: [String: Any]) throws {
+        try self.sendPayload([
+            "id": id,
+            "result": result,
+        ])
+    }
+
+    private func sendErrorResponse(id: Int, message: String) throws {
+        try self.sendPayload([
+            "id": id,
+            "error": [
+                "code": -32603,
+                "message": message,
+            ],
+        ])
+    }
+
+    private func sendPayload(_ payload: [String: Any]) throws {
         let data = try JSONSerialization.data(withJSONObject: payload)
         self.stdinPipe.fileHandleForWriting.write(data)
         self.stdinPipe.fileHandleForWriting.write(Data([0x0A]))
@@ -286,14 +388,193 @@ private final class CodexRPCClient: @unchecked Sendable {
     }
 }
 
+private struct PiCodexAuthFetcher {
+    func fetchTokens() throws -> PiCodexAuthTokens {
+        let helperURL = try self.helperScriptURL()
+        let nodePath = try self.resolvedNodeExecutablePath()
+
+        let result = try self.runProcess(
+            executablePath: nodePath,
+            arguments: [helperURL.path],
+            environment: ProcessInfo.processInfo.environment
+        )
+
+        let stdout = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !stdout.isEmpty else {
+            throw CodexFetchError.malformedResponse(result.stderr.isEmpty ? nil : result.stderr)
+        }
+
+        let data = Data(stdout.utf8)
+        let decoded = try JSONDecoder().decode(PiCodexAuthHelperResponse.self, from: data)
+
+        if decoded.status == "noAuth" {
+            throw PiCodexHelperAvailability.noAuth
+        }
+
+        guard let accessToken = decoded.accessToken,
+              !accessToken.isEmpty,
+              let accountID = decoded.chatgptAccountId,
+              !accountID.isEmpty
+        else {
+            throw CodexFetchError.malformedResponse(result.stderr.isEmpty ? nil : result.stderr)
+        }
+
+        return PiCodexAuthTokens(
+            accessToken: accessToken,
+            chatgptAccountId: accountID,
+            chatgptPlanType: decoded.chatgptPlanType
+        )
+    }
+
+    private func helperScriptURL() throws -> URL {
+        if let url = Bundle.module.url(forResource: "codex-pi-helper.bundle", withExtension: "mjs") {
+            return url
+        }
+        throw PiCodexHelperAvailability.unavailable
+    }
+
+    private func resolvedNodeExecutablePath() throws -> String {
+        let candidates = self.nodeExecutableCandidates()
+        if let direct = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            return direct
+        }
+
+        if let shellResolved = self.nodeFromLoginShell(shell: "/bin/zsh") {
+            return shellResolved
+        }
+
+        if let shellResolved = self.nodeFromLoginShell(shell: "/bin/bash") {
+            return shellResolved
+        }
+
+        throw CodexFetchError.nodeNotFound(candidates)
+    }
+
+    private func nodeExecutableCandidates() -> [String] {
+        let env = ProcessInfo.processInfo.environment
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+
+        var candidates: [String] = []
+        if let override = env["LLM_BAR_NODE_PATH"]?.trimmingCharacters(in: .whitespacesAndNewlines), !override.isEmpty {
+            candidates.append((override as NSString).expandingTildeInPath)
+        }
+
+        candidates.append(contentsOf: [
+            "\(home)/bin/node",
+            "\(home)/.volta/bin/node",
+            "/opt/homebrew/bin/node",
+            "/usr/local/bin/node",
+            "/usr/bin/node",
+        ])
+
+        if let path = env["PATH"], !path.isEmpty {
+            for directory in path.split(separator: ":") {
+                candidates.append(String(directory) + "/node")
+            }
+        }
+
+        var seen: Set<String> = []
+        return candidates.compactMap { candidate in
+            let normalized = URL(fileURLWithPath: candidate).standardizedFileURL.path
+            guard seen.insert(normalized).inserted else { return nil }
+            return normalized
+        }
+    }
+
+    private func nodeFromLoginShell(shell: String) -> String? {
+        guard FileManager.default.isExecutableFile(atPath: shell) else { return nil }
+
+        do {
+            let result = try self.runProcess(
+                executablePath: shell,
+                arguments: ["-lc", "command -v node 2>/dev/null || true"],
+                environment: ProcessInfo.processInfo.environment
+            )
+            let path = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !path.isEmpty, FileManager.default.isExecutableFile(atPath: path) else {
+                return nil
+            }
+            return path
+        } catch {
+            return nil
+        }
+    }
+
+    private func runProcess(
+        executablePath: String,
+        arguments: [String],
+        environment: [String: String]
+    ) throws -> (stdout: String, stderr: String, status: Int32) {
+        let process = Process()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = arguments
+        process.environment = environment
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        do {
+            try process.run()
+        } catch {
+            throw CodexFetchError.launchFailed(error.localizedDescription)
+        }
+
+        process.waitUntilExit()
+
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        let stdout = String(decoding: stdoutData, as: UTF8.self)
+        let stderr = String(decoding: stderrData, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if process.terminationStatus != 0 {
+            if stderr.contains("noAuth") || stderr.contains("Pi Codex OAuth is unavailable") {
+                throw PiCodexHelperAvailability.noAuth
+            }
+            throw CodexFetchError.launchFailed(stderr.isEmpty ? "Helper exited with status \(process.terminationStatus)." : stderr)
+        }
+
+        return (stdout: stdout, stderr: stderr, status: process.terminationStatus)
+    }
+}
+
 struct CodexFetcher {
     func fetch() async throws -> CodexSnapshot {
-        let client = try CodexRPCClient()
+        let codexPath = try CodexRPCClient.resolvedCodexExecutablePath()
+        let piAuthFetcher = PiCodexAuthFetcher()
+
+        do {
+            let initialTokens = try piAuthFetcher.fetchTokens()
+            let client = try CodexRPCClient(
+                codexPath: codexPath,
+                externalAuthTokenProvider: { _ in
+                    try piAuthFetcher.fetchTokens()
+                }
+            )
+            defer { client.shutdown() }
+
+            try await client.initialize()
+            try await client.loginWithChatGPTTokens(initialTokens)
+            let limits = try await client.fetchRateLimits()
+            return try self.makeSnapshot(limits, sourceLabel: "Pi auth")
+        } catch PiCodexHelperAvailability.noAuth,
+                PiCodexHelperAvailability.unavailable,
+                CodexFetchError.nodeNotFound(_)
+        {
+            // Fall back to Codex CLI-managed auth when Pi-backed auth is unavailable.
+        }
+
+        let client = try CodexRPCClient(codexPath: codexPath)
         defer { client.shutdown() }
 
         try await client.initialize()
         let limits = try await client.fetchRateLimits()
+        return try self.makeSnapshot(limits, sourceLabel: "Codex CLI")
+    }
 
+    private func makeSnapshot(_ limits: RPCRateLimitSnapshot, sourceLabel: String) throws -> CodexSnapshot {
         let primary = limits.primary.map { self.makeWindow($0) }
         let secondary = limits.secondary.map { self.makeWindow($0) }
         let credits = Double(limits.credits?.balance ?? "")
@@ -306,6 +587,7 @@ struct CodexFetcher {
             session: primary,
             weekly: secondary,
             creditsRemaining: credits,
+            sourceLabel: sourceLabel,
             updatedAt: Date()
         )
     }

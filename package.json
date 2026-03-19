@@ -1,0 +1,13 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:pi-helper": "esbuild Helpers/codex-pi-auth-rate-limits.mjs --bundle --platform=node --format=esm --target=node20 --banner:js=\"import { createRequire as __createRequire } from 'node:module'; const require = __createRequire(import.meta.url);\" --outfile=Sources/LLMUsageBar/Resources/codex-pi-helper.bundle.mjs"
+  },
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "0.60.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.0"
+  }
+}

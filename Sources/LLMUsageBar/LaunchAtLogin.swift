@@ -49,7 +49,6 @@ enum LaunchAtLoginManager {
             "Label": self.label,
             "ProgramArguments": [executablePath],
             "RunAtLoad": true,
-            "KeepAlive": true,
             "ProcessType": "Interactive",
             "StandardOutPath": stdoutPath,
             "StandardErrorPath": stderrPath,

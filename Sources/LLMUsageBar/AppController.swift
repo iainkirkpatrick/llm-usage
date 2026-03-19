@@ -156,6 +156,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         let credits = NSMenuItem(title: "Credits: \(Formatting.currency(codex.creditsRemaining))", action: nil, keyEquivalent: "")
         credits.isEnabled = false
         menu.addItem(credits)
+
+        let source = NSMenuItem(title: "Source: \(codex.sourceLabel)", action: nil, keyEquivalent: "")
+        source.isEnabled = false
+        menu.addItem(source)
     }
 
     private func addOpenCodeSection(to menu: NSMenu, snapshot: AppSnapshot) {

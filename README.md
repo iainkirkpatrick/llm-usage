@@ -15,6 +15,13 @@ cd ~/Development/iainkirkpatrick/llm-usage
 swift run
 ```
 
+If you change the Pi-backed Codex helper, rebuild the bundled helper script first:
+
+```bash
+npm install
+npm run build:pi-helper
+```
+
 Installed app (via dotfiles, using GitHub Releases):
 
 ```bash
@@ -45,6 +52,16 @@ Example:
   "refreshIntervalSeconds" : 300
 }
 ```
+
+### Codex setup
+
+Codex rate limits are fetched from the Codex app-server.
+
+If Pi has an `openai-codex` OAuth login in `~/.pi/agent/auth.json`, the app prefers that Pi-managed auth for Codex session/weekly limits and falls back to the Codex CLI's own login when Pi auth is unavailable.
+
+Pi-backed Codex fetching uses a bundled Node helper, so a `node` executable must be discoverable from your login shell or configured via `LLM_BAR_NODE_PATH`.
+
+The menu shows the active source as either **Pi auth** or **Codex CLI**.
 
 ### Pi setup
 
@@ -89,6 +106,7 @@ If no manual cookie is configured, the fetcher also attempts a Chromium/Chrome c
 You can also run with env vars:
 
 - `LLM_BAR_CODEX_PATH`
+- `LLM_BAR_NODE_PATH`
 - `LLM_BAR_OPENCODE_COOKIE`
 - `LLM_BAR_OPENCODE_WORKSPACE_ID`
 - `LLM_BAR_PI_SESSIONS_DIR`
