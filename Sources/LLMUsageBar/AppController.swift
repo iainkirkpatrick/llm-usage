@@ -200,6 +200,15 @@ final class AppController: NSObject, NSApplicationDelegate {
             )
             monthly.isEnabled = false
             menu.addItem(monthly)
+        } else {
+            menu.addItem(self.disabledItem("Billing summary unavailable from current OpenCode API"))
+        }
+
+        menu.addItem(self.disabledItem("Usage rows fetched: \(Formatting.compactNumber(openCode.rows.count))"))
+
+        let latestUsage = openCode.rows.first?.timeCreated
+        if let latestUsage {
+            menu.addItem(self.disabledItem("Latest usage: \(Formatting.lastUpdated(latestUsage))"))
         }
 
         let lastFiveHours = OpenCodeModelSummary.aggregate(rows: openCode.rows, window: 5 * 60 * 60)

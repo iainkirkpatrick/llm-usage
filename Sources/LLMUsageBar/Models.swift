@@ -58,8 +58,6 @@ struct OpenCodeModelSummary: Sendable {
         }
 
         for row in rows where row.timeCreated >= cutoff {
-            guard row.plan == nil || row.plan == "sub" else { continue }
-
             let key = models.first(where: { row.model.lowercased().contains($0) })
             guard let key else { continue }
 

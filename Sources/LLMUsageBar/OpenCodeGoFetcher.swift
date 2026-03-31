@@ -30,8 +30,8 @@ enum OpenCodeGoError: LocalizedError {
 
 struct OpenCodeGoFetcher {
     private let workspaceListID = "def39973159c7f0483d8793a822b8dbb10d067e12c65455fcb4608459ba0234f"
-    private let subscriptionID = "f6fef39ee2c7c233a226d062b50a92eef4a30ebec5d3ec95b8092081d13ddc75"
-    private let usageHistoryID = "329c8c3a3db6af6ea9c1936376af2e8afc75fa2330999ddfaab1cacd6f2c1157"
+    private let billingInfoID = "c83b78a614689c38ebee981f9b39a8b377716db85c1fd7dbab604adc02d3313d"
+    private let usageListID = "6262ba54bff26cd7ec162f93db420e0d19df9cd94b2233dfe3b6b24c3f990388"
 
     private let baseURL = URL(string: "https://opencode.ai")!
 
@@ -49,10 +49,10 @@ struct OpenCodeGoFetcher {
 
         let resolvedWorkspaceID = try await self.resolveWorkspaceID(cookieHeader: resolvedCookieHeader, configured: workspaceID)
         let limitsAny = try? await self.callServerFunction(
-            id: self.subscriptionID,
+            id: self.billingInfoID,
             args: [resolvedWorkspaceID],
             cookieHeader: resolvedCookieHeader,
-            refererPath: "/workspace/\(resolvedWorkspaceID)/billing"
+            refererPath: "/workspace/\(resolvedWorkspaceID)"
         )
         let limits = limitsAny.flatMap { Self.parseLimits(from: $0) }
 
@@ -133,23 +133,14 @@ struct OpenCodeGoFetcher {
     }
 
     private func fetchUsageRows(workspaceID: String, cookieHeader: String) async throws -> [OpenCodeUsageRow] {
-        let pageSize = 50
-        let maxPages = 6
-        var allRows: [OpenCodeUsageRow] = []
+        let any = try await self.callServerFunction(
+            id: self.usageListID,
+            args: [workspaceID],
+            cookieHeader: cookieHeader,
+            refererPath: "/workspace/\(workspaceID)"
+        )
 
-        for page in 0..<maxPages {
-            let any = try await self.callServerFunction(
-                id: self.usageHistoryID,
-                args: [workspaceID, page],
-                cookieHeader: cookieHeader,
-                refererPath: "/workspace/\(workspaceID)"
-            )
-            let rows = Self.extractUsageRows(from: any)
-            allRows.append(contentsOf: rows)
-            if rows.count < pageSize { break }
-        }
-
-        return allRows.sorted(by: { $0.timeCreated > $1.timeCreated })
+        return Self.extractUsageRows(from: any).sorted(by: { $0.timeCreated > $1.timeCreated })
     }
 
     private func callServerFunction(
@@ -209,7 +200,15 @@ struct OpenCodeGoFetcher {
 
         let contentType = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
         if contentType.contains("application/json") {
-            return try JSONSerialization.jsonObject(with: data, options: [])
+            let object = try JSONSerialization.jsonObject(with: data, options: [])
+            if let dict = object as? [String: Any],
+               let status = Self.int(dict["status"]),
+               status >= 400
+            {
+                let message = (dict["message"] as? String) ?? "HTTP \(status)"
+                throw OpenCodeGoError.apiError(message)
+            }
+            return object
         }
 
         guard let text = String(data: data, encoding: .utf8) else {
@@ -232,7 +231,7 @@ struct OpenCodeGoFetcher {
         context?.exceptionHandler = { _, _ in }
 
         _ = context?.evaluateScript(
-            "var self = {}; " +
+            "var self = {}; var $R = self.$R = self.$R || {}; " +
                 "function Headers(init){ this.init = init; } " +
                 "function Response(body, init){ this.body = body; this.init = init || {}; this.status = this.init.status; this.statusText = this.init.statusText; this.headers = this.init.headers; }"
         )
@@ -292,6 +291,7 @@ struct OpenCodeGoFetcher {
         let rolling = self.parseWindow(dict["rollingUsage"] as? [String: Any], now: now)
         let weekly = self.parseWindow(dict["weeklyUsage"] as? [String: Any], now: now)
         let monthly = self.parseWindow(dict["monthlyUsage"] as? [String: Any], now: now)
+            ?? self.parseUsageWindow(used: dict["monthlyUsage"], limit: dict["monthlyLimit"])
 
         if rolling != nil || weekly != nil || monthly != nil {
             return OpenCodeGoLimits(
@@ -316,6 +316,13 @@ struct OpenCodeGoFetcher {
         let resetAt: Date? = resetInSec.map { now.addingTimeInterval(TimeInterval($0)) }
 
         return RateWindow(usedPercent: usedPercent, resetAt: resetAt)
+    }
+
+    private static func parseUsageWindow(used usedAny: Any?, limit limitAny: Any?) -> RateWindow? {
+        guard let used = self.double(usedAny), let limit = self.double(limitAny), limit > 0 else {
+            return nil
+        }
+        return RateWindow(usedPercent: (used / limit) * 100, resetAt: nil)
     }
 
     private static func extractWorkspaceIDs(from any: Any) -> [String] {
@@ -400,6 +407,8 @@ struct OpenCodeGoFetcher {
 
     private static func parseDate(_ value: Any?) -> Date? {
         switch value {
+        case let date as Date:
+            return date
         case let number as NSNumber:
             let raw = number.doubleValue
             if raw > 1_000_000_000_000 {
