@@ -558,20 +558,31 @@ struct CodexFetcher {
             try await client.initialize()
             try await client.loginWithChatGPTTokens(initialTokens)
             let limits = try await client.fetchRateLimits()
+            AppLog.info("Codex Pi-auth fetch succeeded")
             return try self.makeSnapshot(limits, sourceLabel: "Pi auth")
-        } catch PiCodexHelperAvailability.noAuth,
-                PiCodexHelperAvailability.unavailable,
-                CodexFetchError.nodeNotFound(_)
-        {
-            // Fall back to Codex CLI-managed auth when Pi-backed auth is unavailable.
+        } catch PiCodexHelperAvailability.noAuth {
+            AppLog.info("Codex Pi auth unavailable; falling back to Codex CLI: no Pi Codex auth")
+        } catch PiCodexHelperAvailability.unavailable {
+            AppLog.info("Codex Pi auth unavailable; falling back to Codex CLI: bundled helper unavailable")
+        } catch CodexFetchError.nodeNotFound(let candidates) {
+            AppLog.info("Codex Pi auth unavailable; falling back to Codex CLI: Node.js executable was not found. Checked: \(candidates.joined(separator: ", ")).")
+        } catch {
+            AppLog.error("Codex Pi-auth fetch failed; not falling back to Codex CLI: \(error.localizedDescription)")
+            throw error
         }
 
-        let client = try CodexRPCClient(codexPath: codexPath)
-        defer { client.shutdown() }
+        do {
+            let client = try CodexRPCClient(codexPath: codexPath)
+            defer { client.shutdown() }
 
-        try await client.initialize()
-        let limits = try await client.fetchRateLimits()
-        return try self.makeSnapshot(limits, sourceLabel: "Codex CLI")
+            try await client.initialize()
+            let limits = try await client.fetchRateLimits()
+            AppLog.info("Codex CLI fallback succeeded")
+            return try self.makeSnapshot(limits, sourceLabel: "Codex CLI")
+        } catch {
+            AppLog.error("Codex CLI fallback failed: \(error.localizedDescription)")
+            throw error
+        }
     }
 
     private func makeSnapshot(_ limits: RPCRateLimitSnapshot, sourceLabel: String) throws -> CodexSnapshot {

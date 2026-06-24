@@ -30,7 +30,30 @@ cd ~/Development/iainkirkpatrick/dotfiles
 open "$HOME/Applications/LLM Usage.app"
 ```
 
-The dotfiles installer downloads the latest public GitHub release by default. If that fails, it falls back to building from local source when `~/Development/iainkirkpatrick/llm-usage` exists.
+The dotfiles installer builds from local source when `~/Development/iainkirkpatrick/llm-usage` exists and Swift is available; otherwise it downloads the latest public GitHub release.
+
+## Command line
+
+The installed launcher opens the menu bar app when run without arguments:
+
+```bash
+llm-usage-bar
+```
+
+It can also print Codex usage for agents/scripts:
+
+```bash
+llm-usage-bar codex
+llm-usage-bar codex --json
+```
+
+Diagnostics check each enabled provider and print the app log location:
+
+```bash
+llm-usage-bar diagnose
+```
+
+Codex CLI mode uses Pi-managed `openai-codex` auth when available and falls back to Codex CLI auth only when Pi auth is unavailable.
 
 ## Config
 
@@ -62,6 +85,8 @@ If Pi has an `openai-codex` OAuth login in `~/.pi/agent/auth.json`, the app pref
 Pi-backed Codex fetching uses a bundled Node helper, so a `node` executable must be discoverable from your login shell or configured via `LLM_BAR_NODE_PATH`.
 
 The menu shows the active source as either **Pi auth** or **Codex CLI**.
+
+Runtime refresh logs are written to `~/.llm-usage-bar/app.log`.
 
 ### Pi setup
 
