@@ -37,6 +37,11 @@ enum Formatting {
         return date.formatted(date: .omitted, time: .shortened)
     }
 
+    static func dateTime(_ date: Date?) -> String {
+        guard let date else { return "no expiry" }
+        return date.formatted(date: .abbreviated, time: .shortened)
+    }
+
     static func compactNumber(_ value: Int) -> String {
         self.compact(Double(value), suffixes: [(1_000_000_000, "B"), (1_000_000, "M"), (1_000, "k")])
     }

@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import UserNotifications
 
 @MainActor
 final class AppController: NSObject, NSApplicationDelegate {
@@ -69,7 +70,103 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     private func refreshAndUpdateMenu() async {
         await self.state.refresh()
+        await self.handleExpiringCodexResets()
         self.rebuildMenu()
+    }
+
+    private func handleExpiringCodexResets() async {
+        guard let resetCredits = self.state.snapshot.codex?.resetCredits else { return }
+        let now = Date()
+        let expiringCredits = resetCredits.credits
+            .compactMap { credit -> (credit: CodexResetCredit, expiry: Date)? in
+                guard let expiry = credit.expiresAt, expiry > now else { return nil }
+                return (credit, expiry)
+            }
+            .sorted { $0.expiry < $1.expiry }
+
+        for item in expiringCredits {
+            let seconds = item.expiry.timeIntervalSince(now)
+            let label = item.credit.title ?? item.credit.description ?? "Saved Codex reset"
+            if seconds <= 24 * 60 * 60 {
+                self.sendResetExpiryNotificationOnce(
+                    key: "\(item.credit.id):24h",
+                    title: "Codex reset expires soon",
+                    body: "\(label) expires in \(Formatting.relativeReset(item.expiry))."
+                )
+            }
+            if seconds <= 6 * 60 * 60 {
+                self.sendResetExpiryNotificationOnce(
+                    key: "\(item.credit.id):6h",
+                    title: "Codex reset expires in \(Formatting.relativeReset(item.expiry))",
+                    body: "\(label) is still available."
+                )
+            }
+        }
+
+        guard self.state.currentConfig.autoRedeemExpiringCodexResets,
+              self.state.canRedeemCodexResets,
+              await self.notificationsAuthorized(),
+              let candidate = expiringCredits.first,
+              candidate.expiry.timeIntervalSince(now) <= 60 * 60,
+              self.claimAutoRedemptionAttempt(for: candidate.credit.id, now: now)
+        else {
+            return
+        }
+
+        do {
+            let result = try await self.state.consumeCodexResetCredit(creditID: candidate.credit.id, automatic: true)
+            let label = candidate.credit.title ?? candidate.credit.description ?? "Saved Codex reset"
+            let body: String
+            switch result.outcome {
+            case "reset", "alreadyRedeemed", "already_redeemed":
+                body = "\(label) was redeemed automatically before expiry."
+            default:
+                body = "\(label) was not redeemed automatically (\(result.outcome))."
+            }
+            self.sendResetExpiryNotificationOnce(
+                key: "\(candidate.credit.id):auto",
+                title: "Codex expiring reset checked",
+                body: body
+            )
+        } catch {
+            self.sendResetExpiryNotificationOnce(
+                key: "\(candidate.credit.id):auto-error",
+                title: "Could not auto-use Codex reset",
+                body: error.localizedDescription
+            )
+        }
+    }
+
+    private func sendResetExpiryNotificationOnce(key: String, title: String, body: String) {
+        guard self.claimPersistentKey(key, storageKey: "codex-reset-expiry-notifications") else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "llm-usage-reset-\(key)", content: content, trigger: nil)) { _ in }
+    }
+
+    private func notificationsAuthorized() async -> Bool {
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        return settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional
+    }
+
+    private func claimAutoRedemptionAttempt(for creditID: String, now: Date) -> Bool {
+        let storageKey = "codex-reset-auto-redemption-attempt"
+        if let timestamp = UserDefaults.standard.object(forKey: storageKey) as? Date,
+           now.timeIntervalSince(timestamp) < 24 * 60 * 60 {
+            return false
+        }
+        UserDefaults.standard.set(now, forKey: storageKey)
+        UserDefaults.standard.set(creditID, forKey: "\(storageKey)-credit-id")
+        return true
+    }
+
+    private func claimPersistentKey(_ key: String, storageKey: String) -> Bool {
+        var keys = Set(UserDefaults.standard.stringArray(forKey: storageKey) ?? [])
+        guard keys.insert(key).inserted else { return false }
+        UserDefaults.standard.set(Array(keys), forKey: storageKey)
+        return true
     }
 
     private func rebuildMenu() {
@@ -91,9 +188,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         self.addCodexSection(to: menu, snapshot: snapshot)
 
-        menu.addItem(.separator())
-        self.addOpenCodeSection(to: menu, snapshot: snapshot)
-
+        // OpenCode Go collection and settings remain available, but its menu section is hidden until it is needed again.
         menu.addItem(.separator())
         self.addPiSection(to: menu, snapshot: snapshot)
 
@@ -156,6 +251,37 @@ final class AppController: NSObject, NSApplicationDelegate {
         let credits = NSMenuItem(title: "Credits: \(Formatting.currency(codex.creditsRemaining))", action: nil, keyEquivalent: "")
         credits.isEnabled = false
         menu.addItem(credits)
+
+        if let resetCredits = codex.resetCredits {
+            let title = resetCredits.availableCount == 1
+                ? "Saved resets: 1 available"
+                : "Saved resets: \(resetCredits.availableCount) available"
+            let resetItem = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            let resetMenu = NSMenu(title: "Saved resets")
+
+            if resetCredits.availableCount == 0 {
+                resetMenu.addItem(self.disabledItem("No saved resets"))
+            } else {
+                if resetCredits.credits.isEmpty {
+                    resetMenu.addItem(self.disabledItem("Details unavailable; redemption is disabled to avoid spending an unspecified reset."))
+                } else if self.state.canRedeemCodexResets {
+                    for credit in resetCredits.credits {
+                        let label = credit.title ?? credit.description ?? "Saved usage-limit reset"
+                        let expiry = Formatting.dateTime(credit.expiresAt)
+                        let useReset = NSMenuItem(title: "Use: \(label) — expires \(expiry)…", action: #selector(self.useSavedReset), keyEquivalent: "")
+                        useReset.target = self
+                        useReset.representedObject = credit.id
+                        resetMenu.addItem(useReset)
+                    }
+                } else {
+                    resetMenu.addItem(.separator())
+                    resetMenu.addItem(self.disabledItem("Refresh Codex usage successfully before using another reset."))
+                }
+            }
+
+            resetItem.submenu = resetMenu
+            menu.addItem(resetItem)
+        }
 
         let source = NSMenuItem(title: "Source: \(codex.sourceLabel)", action: nil, keyEquivalent: "")
         source.isEnabled = false
@@ -308,11 +434,13 @@ final class AppController: NSObject, NSApplicationDelegate {
         codexToggle.state = config.codexEnabled ? .on : .off
         settingsMenu.addItem(codexToggle)
 
-        let openCodeToggle = NSMenuItem(title: "Enable OpenCode Go", action: #selector(self.toggleOpenCodeEnabled), keyEquivalent: "")
-        openCodeToggle.target = self
-        openCodeToggle.state = config.openCodeEnabled ? .on : .off
-        settingsMenu.addItem(openCodeToggle)
+        let autoRedeemResetsToggle = NSMenuItem(title: "Auto-use Codex resets in final hour", action: #selector(self.toggleAutoRedeemExpiringCodexResets), keyEquivalent: "")
+        autoRedeemResetsToggle.target = self
+        autoRedeemResetsToggle.state = config.autoRedeemExpiringCodexResets ? .on : .off
+        autoRedeemResetsToggle.isEnabled = config.codexEnabled
+        settingsMenu.addItem(autoRedeemResetsToggle)
 
+        // OpenCode Go settings remain implemented but are intentionally hidden until needed again.
         let piToggle = NSMenuItem(title: "Enable Pi", action: #selector(self.togglePiEnabled), keyEquivalent: "")
         piToggle.target = self
         piToggle.state = config.piEnabled ? .on : .off
@@ -350,30 +478,6 @@ final class AppController: NSObject, NSApplicationDelegate {
         clearPiSessionsDir.target = self
         clearPiSessionsDir.isEnabled = (config.piSessionsDirectory?.isEmpty == false)
         settingsMenu.addItem(clearPiSessionsDir)
-
-        settingsMenu.addItem(.separator())
-
-        let importCookie = NSMenuItem(title: "Import OpenCode cookie from Chromium", action: #selector(self.importOpenCodeCookieFromBrowser), keyEquivalent: "")
-        importCookie.target = self
-        settingsMenu.addItem(importCookie)
-
-        let setCookie = NSMenuItem(title: "Set OpenCode cookie…", action: #selector(self.setOpenCodeCookie), keyEquivalent: "")
-        setCookie.target = self
-        settingsMenu.addItem(setCookie)
-
-        let clearCookie = NSMenuItem(title: "Clear OpenCode cookie", action: #selector(self.clearOpenCodeCookie), keyEquivalent: "")
-        clearCookie.target = self
-        clearCookie.isEnabled = (config.openCodeCookieHeader?.isEmpty == false)
-        settingsMenu.addItem(clearCookie)
-
-        let setWorkspace = NSMenuItem(title: "Set workspace ID…", action: #selector(self.setOpenCodeWorkspace), keyEquivalent: "")
-        setWorkspace.target = self
-        settingsMenu.addItem(setWorkspace)
-
-        let clearWorkspace = NSMenuItem(title: "Clear workspace ID", action: #selector(self.clearOpenCodeWorkspace), keyEquivalent: "")
-        clearWorkspace.target = self
-        clearWorkspace.isEnabled = (config.openCodeWorkspaceID?.isEmpty == false)
-        settingsMenu.addItem(clearWorkspace)
 
         settingsMenu.addItem(.separator())
 
@@ -537,8 +641,95 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func useSavedReset(_ sender: NSMenuItem) {
+        guard let resetCredits = self.state.snapshot.codex?.resetCredits,
+              resetCredits.availableCount > 0
+        else {
+            self.showAlert(title: "No saved reset available", message: "Refresh Codex usage and try again.", style: .warning)
+            return
+        }
+
+        guard let creditID = sender.representedObject as? String,
+              let selectedCredit = resetCredits.credits.first(where: { $0.id == creditID })
+        else {
+            self.showAlert(title: "Saved reset is no longer available", message: "Refresh Codex usage and choose a current reset.", style: .warning)
+            return
+        }
+
+        let label = selectedCredit.title ?? selectedCredit.description ?? "the selected saved reset"
+        let expiry = " It expires \(Formatting.dateTime(selectedCredit.expiresAt))."
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Use saved Codex reset?"
+        alert.informativeText = "This will spend one saved reset to refresh your Codex rate-limit windows. This cannot be undone.\n\nSelected: \(label).\(expiry)"
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Use reset")
+        NSRunningApplication.current.activate()
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try await self.state.consumeCodexResetCredit(creditID: creditID)
+                self.rebuildMenu()
+                self.showResetOutcome(result)
+            } catch {
+                self.rebuildMenu()
+                self.showAlert(title: "Could not use saved reset", message: error.localizedDescription, style: .warning)
+            }
+        }
+    }
+
+    private func showResetOutcome(_ result: CodexResetRedemptionResult) {
+        let refreshNote = result.refreshError.map { "\n\nThe reset result is confirmed, but usage could not be refreshed: \($0). Use Refresh now before choosing another reset." } ?? ""
+
+        switch result.outcome {
+        case "reset", "alreadyRedeemed", "already_redeemed":
+            let message = result.refreshError == nil
+                ? "Codex usage was refreshed and the display has been updated."
+                : "Codex reset was applied.\(refreshNote)"
+            self.showAlert(title: "Saved reset used", message: message)
+        case "nothingToReset", "nothing_to_reset":
+            self.showAlert(title: "No usage window needed resetting", message: "Your saved reset was not used.\(refreshNote)", style: .warning)
+        case "noCredit", "no_credit":
+            self.showAlert(title: "No saved reset available", message: "The available reset credits changed before redemption.\(refreshNote)", style: .warning)
+        default:
+            self.showAlert(title: "Saved reset was not applied", message: "Codex returned: \(result.outcome).\(refreshNote)", style: .warning)
+        }
+    }
+
     @objc private func toggleCodexEnabled() {
         self.applyConfigMutation { $0.codexEnabled.toggle() }
+    }
+
+    @objc private func toggleAutoRedeemExpiringCodexResets() {
+        let enabled = self.state.currentConfig.autoRedeemExpiringCodexResets
+        guard !enabled else {
+            self.applyConfigMutation { $0.autoRedeemExpiringCodexResets = false }
+            return
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Auto-use expiring Codex resets?"
+        alert.informativeText = "When a known saved reset reaches its final hour, LLM Usage Bar will redeem that specific credit automatically. It will notify you at 24 hours, 6 hours, and after redemption. This spends a reset credit and cannot be undone."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Enable auto-use")
+        NSRunningApplication.current.activate()
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+
+        Task { [weak self] in
+            guard let self else { return }
+            let granted = (try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])) == true
+            guard granted else {
+                self.showAlert(title: "Notifications are required", message: "Auto-use remains off because LLM Usage Bar needs to notify you before and after an expiring reset is redeemed.", style: .warning)
+                return
+            }
+            self.applyConfigMutation { $0.autoRedeemExpiringCodexResets = true }
+        }
     }
 
     @objc private func toggleOpenCodeEnabled() {

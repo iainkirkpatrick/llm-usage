@@ -18,7 +18,12 @@ private struct CodexCLIOutput: Encodable {
     struct Codex: Encodable {
         let session: Window?
         let weekly: Window?
+        struct ResetCredits: Encodable {
+            let availableCount: Int
+        }
+
         let creditsRemaining: Double?
+        let resetCredits: ResetCredits?
         let source: String
         let updatedAt: Date
     }
@@ -76,6 +81,10 @@ enum CLI {
             self.writeLine("Session left: \(Formatting.percent(snapshot.session?.remainingPercent)) (resets in \(Formatting.relativeReset(snapshot.session?.resetAt)))", to: FileHandle.standardOutput)
             self.writeLine("Weekly left: \(Formatting.percent(snapshot.weekly?.remainingPercent)) (resets in \(Formatting.relativeReset(snapshot.weekly?.resetAt)))", to: FileHandle.standardOutput)
             self.writeLine("Credits: \(Formatting.currency(snapshot.creditsRemaining))", to: FileHandle.standardOutput)
+            if let resetCredits = snapshot.resetCredits {
+                let expiry = resetCredits.earliestExpiry.map { " (earliest expires \(Formatting.dateTime($0)))" } ?? ""
+                self.writeLine("Saved resets: \(resetCredits.availableCount) available\(expiry)", to: FileHandle.standardOutput)
+            }
         }
     }
 
@@ -133,6 +142,7 @@ enum CLI {
             session: snapshot.session.map(self.windowOutput),
             weekly: snapshot.weekly.map(self.windowOutput),
             creditsRemaining: snapshot.creditsRemaining,
+            resetCredits: snapshot.resetCredits.map { .init(availableCount: $0.availableCount) },
             source: snapshot.sourceLabel,
             updatedAt: snapshot.updatedAt
         ))

@@ -2,7 +2,7 @@
 
 Small macOS menu bar app to track:
 
-- **Codex** usage (session + weekly + credits)
+- **Codex** usage (session + weekly + credits + saved rate-limit resets)
 - **OpenCode Go** usage (5h/weekly/monthly + model usage history for GLM-5, Kimi K2.5, MiniMax M2.5)
 - **Pi** local session usage (today / last 7d / last 30d + model/provider/project summaries)
 
@@ -40,7 +40,7 @@ The installed launcher opens the menu bar app when run without arguments:
 llm-usage-bar
 ```
 
-It can also print Codex usage for agents/scripts:
+It can also print Codex usage and the available saved-reset count for agents/scripts:
 
 ```bash
 llm-usage-bar codex
@@ -66,6 +66,7 @@ Example:
 ```json
 {
   "codexEnabled" : true,
+  "autoRedeemExpiringCodexResets" : false,
   "openCodeCookieHeader" : null,
   "openCodeEnabled" : true,
   "openCodeWorkspaceID" : null,
@@ -78,7 +79,7 @@ Example:
 
 ### Codex setup
 
-Codex rate limits are fetched from the Codex app-server.
+Codex rate limits and saved reset credits are fetched from the Codex app-server. When credits are available, the menu lists their expiry and offers an explicit, Cancel-by-default confirmation before spending one. The Settings menu can opt in to automatically redeem the specific earliest-expiring saved reset during its final hour; it sends local notifications at 24 hours, 6 hours, and after the redemption attempt.
 
 If Pi has an `openai-codex` OAuth login in `~/.pi/agent/auth.json`, the app prefers that Pi-managed auth for Codex session/weekly limits and falls back to the Codex CLI's own login when Pi auth is unavailable.
 

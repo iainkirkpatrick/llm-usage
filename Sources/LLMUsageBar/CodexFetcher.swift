@@ -1,13 +1,34 @@
 import Foundation
+import UserNotifications
 
 private struct RPCRateLimitsResponse: Decodable {
     let rateLimits: RPCRateLimitSnapshot
+    let rateLimitResetCredits: RPCRateLimitResetCredits?
 }
 
 private struct RPCRateLimitSnapshot: Decodable {
     let primary: RPCRateLimitWindow?
     let secondary: RPCRateLimitWindow?
     let credits: RPCCreditsSnapshot?
+}
+
+private struct RPCRateLimitResetCredits: Decodable {
+    let availableCount: Int
+    let credits: [RPCRateLimitResetCredit]?
+}
+
+private struct RPCRateLimitResetCredit: Decodable {
+    let id: String
+    let resetType: String?
+    let status: String?
+    let grantedAt: Int?
+    let expiresAt: Int?
+    let title: String?
+    let description: String?
+}
+
+private struct RPCRateLimitResetCreditConsumeResponse: Decodable {
+    let outcome: String
 }
 
 private struct RPCRateLimitWindow: Decodable {
@@ -38,6 +59,7 @@ enum CodexFetchError: LocalizedError {
     case launchFailed(String)
     case malformedResponse(String?)
     case noData
+    case autoRedemptionDisabled
 
     var errorDescription: String? {
         switch self {
@@ -60,6 +82,8 @@ enum CodexFetchError: LocalizedError {
             return "Codex returned malformed RPC data: \(details)"
         case .noData:
             return "Codex did not provide usage windows."
+        case .autoRedemptionDisabled:
+            return "Automatic Codex reset redemption is no longer enabled."
         }
     }
 }
@@ -209,9 +233,20 @@ private final class CodexRPCClient: @unchecked Sendable {
         _ = try await self.request(method: "account/login/start", params: params)
     }
 
-    func fetchRateLimits() async throws -> RPCRateLimitSnapshot {
-        let response: RPCRateLimitsResponse = try await self.requestAndDecode(method: "account/rateLimits/read")
-        return response.rateLimits
+    func fetchRateLimits() async throws -> RPCRateLimitsResponse {
+        try await self.requestAndDecode(method: "account/rateLimits/read")
+    }
+
+    func consumeRateLimitResetCredit(idempotencyKey: String, creditID: String?) async throws -> String {
+        var params: [String: Any] = ["idempotencyKey": idempotencyKey]
+        if let creditID {
+            params["creditId"] = creditID
+        }
+        let response: RPCRateLimitResetCreditConsumeResponse = try await self.requestAndDecode(
+            method: "account/rateLimitResetCredit/consume",
+            params: params
+        )
+        return response.outcome
     }
 
     static func resolvedCodexExecutablePath() throws -> String {
@@ -253,8 +288,8 @@ private final class CodexRPCClient: @unchecked Sendable {
         }
     }
 
-    private func requestAndDecode<T: Decodable>(method: String) async throws -> T {
-        let message = try await self.request(method: method)
+    private func requestAndDecode<T: Decodable>(method: String, params: [String: Any]? = nil) async throws -> T {
+        let message = try await self.request(method: method, params: params)
         guard let result = message["result"] else {
             throw CodexFetchError.malformedResponse(self.stderrCollector.text())
         }
@@ -585,10 +620,84 @@ struct CodexFetcher {
         }
     }
 
-    private func makeSnapshot(_ limits: RPCRateLimitSnapshot, sourceLabel: String) throws -> CodexSnapshot {
+    func consumeResetCredit(creditID: String, idempotencyKey: String, automatic: Bool = false) async throws -> String {
+        let codexPath = try CodexRPCClient.resolvedCodexExecutablePath()
+        let piAuthFetcher = PiCodexAuthFetcher()
+
+        do {
+            let initialTokens = try piAuthFetcher.fetchTokens()
+            let client = try CodexRPCClient(
+                codexPath: codexPath,
+                externalAuthTokenProvider: { _ in
+                    try piAuthFetcher.fetchTokens()
+                }
+            )
+            defer { client.shutdown() }
+
+            try await client.initialize()
+            try await client.loginWithChatGPTTokens(initialTokens)
+            if automatic {
+                let authorized = await Self.autoRedemptionStillAuthorized()
+                if !authorized {
+                    throw CodexFetchError.autoRedemptionDisabled
+                }
+            }
+            let outcome = try await client.consumeRateLimitResetCredit(idempotencyKey: idempotencyKey, creditID: creditID)
+            AppLog.info("Codex saved reset redemption completed via Pi auth: \(outcome)")
+            return outcome
+        } catch PiCodexHelperAvailability.noAuth {
+            AppLog.info("Codex Pi auth unavailable for saved reset redemption; falling back to Codex CLI")
+        } catch PiCodexHelperAvailability.unavailable {
+            AppLog.info("Codex Pi auth helper unavailable for saved reset redemption; falling back to Codex CLI")
+        } catch CodexFetchError.nodeNotFound {
+            AppLog.info("Node.js unavailable for Pi-backed saved reset redemption; falling back to Codex CLI")
+        } catch {
+            AppLog.error("Codex Pi-auth saved reset redemption failed; not falling back to Codex CLI: \(error.localizedDescription)")
+            throw error
+        }
+
+        let client = try CodexRPCClient(codexPath: codexPath)
+        defer { client.shutdown() }
+        try await client.initialize()
+        if automatic {
+            let authorized = await Self.autoRedemptionStillAuthorized()
+            if !authorized {
+                throw CodexFetchError.autoRedemptionDisabled
+            }
+        }
+        let outcome = try await client.consumeRateLimitResetCredit(idempotencyKey: idempotencyKey, creditID: creditID)
+        AppLog.info("Codex saved reset redemption completed via Codex CLI: \(outcome)")
+        return outcome
+    }
+
+    private static func autoRedemptionStillAuthorized() async -> Bool {
+        let config = ConfigStore.load()
+        guard config.codexEnabled, config.autoRedeemExpiringCodexResets else { return false }
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        return settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional
+    }
+
+    private func makeSnapshot(_ response: RPCRateLimitsResponse, sourceLabel: String) throws -> CodexSnapshot {
+        let limits = response.rateLimits
         let primary = limits.primary.map { self.makeWindow($0) }
         let secondary = limits.secondary.map { self.makeWindow($0) }
         let credits = Double(limits.credits?.balance ?? "")
+        let resetCredits = response.rateLimitResetCredits.map { summary in
+            CodexResetCredits(
+                availableCount: max(0, summary.availableCount),
+                credits: (summary.credits ?? []).map { credit in
+                    CodexResetCredit(
+                        id: credit.id,
+                        resetType: credit.resetType,
+                        status: credit.status,
+                        grantedAt: credit.grantedAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+                        expiresAt: credit.expiresAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+                        title: credit.title,
+                        description: credit.description
+                    )
+                }
+            )
+        }
 
         guard primary != nil || secondary != nil else {
             throw CodexFetchError.noData
@@ -598,6 +707,7 @@ struct CodexFetcher {
             session: primary,
             weekly: secondary,
             creditsRemaining: credits,
+            resetCredits: resetCredits,
             sourceLabel: sourceLabel,
             updatedAt: Date()
         )

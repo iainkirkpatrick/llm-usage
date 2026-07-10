@@ -9,6 +9,7 @@ struct AppConfig: Codable {
     var piEnabled: Bool
     var piSessionsDirectory: String?
     var piDeduplicateForkHistory: Bool
+    var autoRedeemExpiringCodexResets: Bool
 
     static let `default` = AppConfig(
         refreshIntervalSeconds: 300,
@@ -18,7 +19,8 @@ struct AppConfig: Codable {
         openCodeCookieHeader: nil,
         piEnabled: true,
         piSessionsDirectory: nil,
-        piDeduplicateForkHistory: true
+        piDeduplicateForkHistory: true,
+        autoRedeemExpiringCodexResets: false
     )
 
     init(
@@ -29,7 +31,8 @@ struct AppConfig: Codable {
         openCodeCookieHeader: String?,
         piEnabled: Bool,
         piSessionsDirectory: String?,
-        piDeduplicateForkHistory: Bool
+        piDeduplicateForkHistory: Bool,
+        autoRedeemExpiringCodexResets: Bool
     ) {
         self.refreshIntervalSeconds = refreshIntervalSeconds
         self.codexEnabled = codexEnabled
@@ -39,6 +42,7 @@ struct AppConfig: Codable {
         self.piEnabled = piEnabled
         self.piSessionsDirectory = piSessionsDirectory
         self.piDeduplicateForkHistory = piDeduplicateForkHistory
+        self.autoRedeemExpiringCodexResets = autoRedeemExpiringCodexResets
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -50,6 +54,7 @@ struct AppConfig: Codable {
         case piEnabled
         case piSessionsDirectory
         case piDeduplicateForkHistory
+        case autoRedeemExpiringCodexResets
     }
 
     init(from decoder: Decoder) throws {
@@ -64,6 +69,7 @@ struct AppConfig: Codable {
         self.piEnabled = try container.decodeIfPresent(Bool.self, forKey: .piEnabled) ?? defaults.piEnabled
         self.piSessionsDirectory = try container.decodeIfPresent(String.self, forKey: .piSessionsDirectory)
         self.piDeduplicateForkHistory = try container.decodeIfPresent(Bool.self, forKey: .piDeduplicateForkHistory) ?? defaults.piDeduplicateForkHistory
+        self.autoRedeemExpiringCodexResets = try container.decodeIfPresent(Bool.self, forKey: .autoRedeemExpiringCodexResets) ?? defaults.autoRedeemExpiringCodexResets
     }
 }
 

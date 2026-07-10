@@ -1,9 +1,60 @@
 import Foundation
 
+private enum CodexResetRedemptionError: LocalizedError {
+    case refreshInProgress
+    case redemptionInProgress
+    case retryPendingReset
+    case selectedCreditUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .refreshInProgress:
+            return "Codex usage is refreshing. Wait for it to finish, then try again."
+        case .redemptionInProgress:
+            return "A saved reset is already being redeemed."
+        case .retryPendingReset:
+            return "The previous reset attempt has an unknown result. Retry that same reset before choosing another."
+        case .selectedCreditUnavailable:
+            return "That saved reset is no longer available on the currently authenticated Codex account."
+        }
+    }
+}
+
+private struct PendingCodexResetRedemption: Codable {
+    let creditID: String
+    let idempotencyKey: String
+}
+
+private enum PendingCodexResetRedemptionStore {
+    private static let fileURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".llm-usage-bar", isDirectory: true)
+        .appendingPathComponent("pending-codex-reset.json")
+
+    static func load() -> PendingCodexResetRedemption? {
+        guard let data = try? Data(contentsOf: self.fileURL) else { return nil }
+        return try? JSONDecoder().decode(PendingCodexResetRedemption.self, from: data)
+    }
+
+    static func save(_ pending: PendingCodexResetRedemption) throws {
+        let directory = self.fileURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let data = try JSONEncoder().encode(pending)
+        try data.write(to: self.fileURL, options: [.atomic])
+        try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: Int16(0o600))], ofItemAtPath: self.fileURL.path)
+    }
+
+    static func clear() {
+        try? FileManager.default.removeItem(at: self.fileURL)
+    }
+}
+
 @MainActor
 final class AppState {
     private(set) var snapshot: AppSnapshot = AppSnapshot(codex: nil, openCode: nil, pi: nil, errors: [], updatedAt: .distantPast)
     private(set) var isRefreshing = false
+    private var isRedeemingCodexReset = false
+    private var pendingCodexResetRedemption: PendingCodexResetRedemption?
+    private var codexResetRefreshRequired = false
 
     private let codexFetcher = CodexFetcher()
     private let openCodeFetcher = OpenCodeGoFetcher()
@@ -12,6 +63,7 @@ final class AppState {
 
     init(config: AppConfig) {
         self.config = config
+        self.pendingCodexResetRedemption = PendingCodexResetRedemptionStore.load()
     }
 
     var currentConfig: AppConfig {
@@ -32,8 +84,70 @@ final class AppState {
         TimeInterval(max(30, self.config.refreshIntervalSeconds))
     }
 
+    var canRedeemCodexResets: Bool {
+        !self.codexResetRefreshRequired && !self.isRefreshing && !self.isRedeemingCodexReset
+    }
+
+    func consumeCodexResetCredit(creditID: String, automatic: Bool = false) async throws -> CodexResetRedemptionResult {
+        guard !automatic || (self.config.codexEnabled && self.config.autoRedeemExpiringCodexResets) else {
+            throw CodexResetRedemptionError.selectedCreditUnavailable
+        }
+        guard !self.isRefreshing else { throw CodexResetRedemptionError.refreshInProgress }
+        guard !self.isRedeemingCodexReset else { throw CodexResetRedemptionError.redemptionInProgress }
+
+        self.isRedeemingCodexReset = true
+        defer { self.isRedeemingCodexReset = false }
+
+        let currentCodex = try await self.codexFetcher.fetch()
+        guard let currentResetCredits = currentCodex.resetCredits,
+              currentResetCredits.availableCount > 0,
+              let currentCredit = currentResetCredits.credits.first(where: { $0.id == creditID })
+        else {
+            throw CodexResetRedemptionError.selectedCreditUnavailable
+        }
+        if automatic {
+            let now = Date()
+            guard self.config.codexEnabled,
+                  self.config.autoRedeemExpiringCodexResets,
+                  currentCredit.status?.lowercased() == "available",
+                  let expiry = currentCredit.expiresAt,
+                  expiry > now,
+                  expiry.timeIntervalSince(now) <= 60 * 60
+            else {
+                throw CodexResetRedemptionError.selectedCreditUnavailable
+            }
+        }
+
+        let attempt: PendingCodexResetRedemption
+        if let pending = self.pendingCodexResetRedemption {
+            guard pending.creditID == creditID else { throw CodexResetRedemptionError.retryPendingReset }
+            attempt = pending
+        } else {
+            attempt = PendingCodexResetRedemption(creditID: creditID, idempotencyKey: UUID().uuidString)
+            try PendingCodexResetRedemptionStore.save(attempt)
+            self.pendingCodexResetRedemption = attempt
+        }
+
+        let outcome = try await self.codexFetcher.consumeResetCredit(
+            creditID: attempt.creditID,
+            idempotencyKey: attempt.idempotencyKey,
+            automatic: automatic
+        )
+        self.pendingCodexResetRedemption = nil
+        PendingCodexResetRedemptionStore.clear()
+
+        do {
+            let refreshedCodex = try await self.codexFetcher.fetch()
+            self.applyCodexRefresh(refreshedCodex)
+            return CodexResetRedemptionResult(outcome: outcome, refreshError: nil)
+        } catch {
+            self.codexResetRefreshRequired = true
+            return CodexResetRedemptionResult(outcome: outcome, refreshError: error.localizedDescription)
+        }
+    }
+
     func refresh() async {
-        guard !self.isRefreshing else { return }
+        guard !self.isRefreshing, !self.isRedeemingCodexReset else { return }
         self.isRefreshing = true
         defer { self.isRefreshing = false }
 
@@ -90,11 +204,39 @@ final class AppState {
             errors: errors,
             updatedAt: Date()
         )
+        if let codexResult {
+            self.codexResetRefreshRequired = false
+            self.clearResolvedPendingCodexReset(using: codexResult)
+        }
 
         if errors.isEmpty {
             AppLog.info("Refresh completed without errors")
         } else {
             AppLog.error("Refresh completed with \(errors.count) error(s): \(errors.joined(separator: " | "))")
         }
+    }
+
+    private func applyCodexRefresh(_ codex: CodexSnapshot) {
+        self.snapshot = AppSnapshot(
+            codex: codex,
+            openCode: self.snapshot.openCode,
+            pi: self.snapshot.pi,
+            errors: self.snapshot.errors.filter { !$0.hasPrefix("Codex:") },
+            updatedAt: Date()
+        )
+        self.codexResetRefreshRequired = false
+        self.clearResolvedPendingCodexReset(using: codex)
+    }
+
+    private func clearResolvedPendingCodexReset(using codex: CodexSnapshot) {
+        guard let pending = self.pendingCodexResetRedemption,
+              let credits = codex.resetCredits?.credits,
+              !credits.isEmpty,
+              !credits.contains(where: { $0.id == pending.creditID })
+        else {
+            return
+        }
+        self.pendingCodexResetRedemption = nil
+        PendingCodexResetRedemptionStore.clear()
     }
 }
