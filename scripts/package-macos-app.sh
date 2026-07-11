@@ -18,8 +18,9 @@ fi
 
 swift build -c release
 
-built_bin="$(find "$BUILD_DIR" -type f -name LLMUsageBar -path '*/release/*' | head -n 1)"
-built_bundle="$(find "$BUILD_DIR" -type d -name "$BUNDLE_NAME" -path '*/release/*' | head -n 1)"
+release_products_dir="$(swift build -c release --show-bin-path)"
+built_bin="$release_products_dir/LLMUsageBar"
+built_bundle="$release_products_dir/$BUNDLE_NAME"
 
 if [ -z "$built_bin" ] || [ ! -f "$built_bin" ]; then
   echo "Built LLMUsageBar binary not found" >&2
@@ -36,7 +37,7 @@ mkdir -p "$DIST_DIR/$APP_NAME/Contents/MacOS" "$DIST_DIR/$APP_NAME/Contents/Reso
 
 cp -f "$built_bin" "$DIST_DIR/$APP_NAME/Contents/MacOS/LLMUsageBar"
 chmod +x "$DIST_DIR/$APP_NAME/Contents/MacOS/LLMUsageBar"
-cp -R "$built_bundle" "$DIST_DIR/$APP_NAME/$BUNDLE_NAME"
+cp -R "$built_bundle" "$DIST_DIR/$APP_NAME/Contents/Resources/$BUNDLE_NAME"
 
 cat > "$DIST_DIR/$APP_NAME/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -66,6 +67,19 @@ cat > "$DIST_DIR/$APP_NAME/Contents/Info.plist" <<EOF
 </dict>
 </plist>
 EOF
+
+CODE_SIGN_IDENTITY="${LLM_USAGE_CODESIGN_IDENTITY:-}"
+if [ -z "$CODE_SIGN_IDENTITY" ] && command -v security >/dev/null 2>&1; then
+  CODE_SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Apple Development:.*\)"/\1/p' | head -n 1)"
+fi
+
+if [ -n "$CODE_SIGN_IDENTITY" ]; then
+  codesign --force --deep --sign "$CODE_SIGN_IDENTITY" "$DIST_DIR/$APP_NAME"
+  codesign --verify --deep --strict "$DIST_DIR/$APP_NAME"
+  echo "Signed $APP_NAME with $CODE_SIGN_IDENTITY"
+else
+  echo "Warning: no Apple Development signing identity found; notification support will be unavailable." >&2
+fi
 
 rm -f "$DIST_DIR/$ARCHIVE_NAME"
 (
