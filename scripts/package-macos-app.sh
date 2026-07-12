@@ -38,6 +38,7 @@ mkdir -p "$DIST_DIR/$APP_NAME/Contents/MacOS" "$DIST_DIR/$APP_NAME/Contents/Reso
 cp -f "$built_bin" "$DIST_DIR/$APP_NAME/Contents/MacOS/LLMUsageBar"
 chmod +x "$DIST_DIR/$APP_NAME/Contents/MacOS/LLMUsageBar"
 cp -R "$built_bundle" "$DIST_DIR/$APP_NAME/Contents/Resources/$BUNDLE_NAME"
+cp -f "$ROOT_DIR/Assets/AppIcon.icns" "$DIST_DIR/$APP_NAME/Contents/Resources/AppIcon.icns"
 
 cat > "$DIST_DIR/$APP_NAME/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -52,6 +53,8 @@ cat > "$DIST_DIR/$APP_NAME/Contents/Info.plist" <<EOF
   <string>com.iainkirkpatrick.llmusagebar</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleName</key>
   <string>LLM Usage</string>
   <key>CFBundlePackageType</key>
