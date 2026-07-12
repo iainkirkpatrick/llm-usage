@@ -6,7 +6,8 @@ VERSION="${1:-${VERSION:-0.1.0}}"
 BUILD_DIR="$ROOT_DIR/.build"
 DIST_DIR="$ROOT_DIR/dist"
 APP_NAME="LLM Usage.app"
-BUNDLE_NAME="LLMUsageBar_LLMUsageBar.bundle"
+APP_BUNDLE_NAME="LLMUsageBar_LLMUsageBar.bundle"
+CORE_BUNDLE_NAME="LLMUsageBar_LLMUsageCore.bundle"
 ARCHIVE_NAME="LLM-Usage-macos.tar.gz"
 
 cd "$ROOT_DIR"
@@ -16,28 +17,36 @@ if [ -f package.json ]; then
   npm run build:pi-helper
 fi
 
-swift build -c release
+swift build -c release --product LLMUsageBar
+swift build -c release --product llm-usage
 
 release_products_dir="$(swift build -c release --show-bin-path)"
 built_bin="$release_products_dir/LLMUsageBar"
-built_bundle="$release_products_dir/$BUNDLE_NAME"
+built_cli="$release_products_dir/llm-usage"
+built_app_bundle="$release_products_dir/$APP_BUNDLE_NAME"
+built_core_bundle="$release_products_dir/$CORE_BUNDLE_NAME"
 
 if [ -z "$built_bin" ] || [ ! -f "$built_bin" ]; then
   echo "Built LLMUsageBar binary not found" >&2
   exit 1
 fi
 
-if [ -z "$built_bundle" ] || [ ! -d "$built_bundle" ]; then
-  echo "Built LLMUsageBar resource bundle not found" >&2
-  exit 1
-fi
+for artifact in "$built_cli" "$built_app_bundle" "$built_core_bundle"; do
+  if [ ! -e "$artifact" ]; then
+    echo "Built artifact not found: $artifact" >&2
+    exit 1
+  fi
+done
 
 rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR/$APP_NAME/Contents/MacOS" "$DIST_DIR/$APP_NAME/Contents/Resources"
 
 cp -f "$built_bin" "$DIST_DIR/$APP_NAME/Contents/MacOS/LLMUsageBar"
 chmod +x "$DIST_DIR/$APP_NAME/Contents/MacOS/LLMUsageBar"
-cp -R "$built_bundle" "$DIST_DIR/$APP_NAME/Contents/Resources/$BUNDLE_NAME"
+cp -f "$built_cli" "$DIST_DIR/$APP_NAME/Contents/MacOS/llm-usage"
+chmod +x "$DIST_DIR/$APP_NAME/Contents/MacOS/llm-usage"
+cp -R "$built_app_bundle" "$DIST_DIR/$APP_NAME/Contents/Resources/$APP_BUNDLE_NAME"
+cp -R "$built_core_bundle" "$DIST_DIR/$APP_NAME/Contents/Resources/$CORE_BUNDLE_NAME"
 cp -f "$ROOT_DIR/Assets/AppIcon.icns" "$DIST_DIR/$APP_NAME/Contents/Resources/AppIcon.icns"
 
 cat > "$DIST_DIR/$APP_NAME/Contents/Info.plist" <<EOF

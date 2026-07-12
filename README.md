@@ -12,7 +12,7 @@ Development:
 
 ```bash
 cd ~/Development/iainkirkpatrick/llm-usage
-swift run
+swift run LLMUsageBar
 ```
 
 If you change the Pi-backed Codex helper, rebuild the bundled helper script first:
@@ -40,12 +40,22 @@ The installed launcher opens the menu bar app when run without arguments:
 llm-usage-bar
 ```
 
-It can also print Codex usage and the available saved-reset count for agents/scripts:
+Codex usage for agents and scripts is provided by the separate portable CLI. Keep its generated `LLMUsageCore` resource bundle alongside the executable when installing it:
 
 ```bash
-llm-usage-bar codex
-llm-usage-bar codex --json
+swift run llm-usage codex
+swift run llm-usage codex --json
+swift run llm-usage diagnose
 ```
+
+On Linux, install the release executable and its required resource directory together:
+
+```bash
+./scripts/install-linux-cli.sh
+$HOME/bin/llm-usage codex --json
+```
+
+Requirements are Swift 6, Node 20 or newer, a compatible local Codex executable providing `app-server`, and Pi-managed Codex authentication. Override the destination with `LLM_USAGE_INSTALL_DIR`.
 
 Diagnostics check each enabled provider and print the app log location:
 
@@ -53,7 +63,7 @@ Diagnostics check each enabled provider and print the app log location:
 llm-usage-bar diagnose
 ```
 
-Codex CLI mode uses Pi-managed `openai-codex` auth when available and falls back to Codex CLI auth only when Pi auth is unavailable.
+Codex usage requires Pi-managed `openai-codex` authentication. The local Codex executable provides the app-server transport but its own login is not used.
 
 ## Config
 
@@ -145,7 +155,7 @@ Example:
 LLM_BAR_CODEX_PATH="$HOME/Applications/Assistants/codex/codex" \
 LLM_BAR_OPENCODE_COOKIE='auth=...' \
 LLM_BAR_PI_SESSIONS_DIR="$HOME/.pi/agent/sessions" \
-swift run
+swift run LLMUsageBar
 ```
 
 ## Startup behavior

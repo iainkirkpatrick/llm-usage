@@ -1,46 +1,5 @@
+import LLMUsageCore
 import Foundation
-
-struct RateWindow: Sendable {
-    let usedPercent: Double
-    let resetAt: Date?
-
-    var remainingPercent: Double {
-        max(0, 100 - self.usedPercent)
-    }
-}
-
-struct CodexResetCredit: Sendable {
-    let id: String
-    let resetType: String?
-    let status: String?
-    let grantedAt: Date?
-    let expiresAt: Date?
-    let title: String?
-    let description: String?
-}
-
-struct CodexResetCredits: Sendable {
-    let availableCount: Int
-    let credits: [CodexResetCredit]
-
-    var earliestExpiry: Date? {
-        self.credits.compactMap(\.expiresAt).min()
-    }
-}
-
-struct CodexResetRedemptionResult: Sendable {
-    let outcome: String
-    let refreshError: String?
-}
-
-struct CodexSnapshot: Sendable {
-    let session: RateWindow?
-    let weekly: RateWindow?
-    let creditsRemaining: Double?
-    let resetCredits: CodexResetCredits?
-    let sourceLabel: String
-    let updatedAt: Date
-}
 
 struct OpenCodeGoLimits: Sendable {
     let fiveHour: RateWindow?

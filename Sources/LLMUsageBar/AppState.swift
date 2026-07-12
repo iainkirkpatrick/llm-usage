@@ -1,4 +1,6 @@
+import LLMUsageCore
 import Foundation
+import UserNotifications
 
 private enum CodexResetRedemptionError: LocalizedError {
     case refreshInProgress
@@ -106,6 +108,11 @@ final class AppState {
             throw CodexResetRedemptionError.selectedCreditUnavailable
         }
         if automatic {
+            let notificationSettings = await UNUserNotificationCenter.current().notificationSettings()
+            guard notificationSettings.authorizationStatus == .authorized ||
+                    notificationSettings.authorizationStatus == .provisional else {
+                throw CodexResetRedemptionError.selectedCreditUnavailable
+            }
             let now = Date()
             guard self.config.codexEnabled,
                   self.config.autoRedeemExpiringCodexResets,
@@ -128,10 +135,25 @@ final class AppState {
             self.pendingCodexResetRedemption = attempt
         }
 
+        let finalAuthorizationCheck: (@MainActor @Sendable () async -> Bool)?
+        if automatic {
+            finalAuthorizationCheck = { [weak self] in
+                guard let self,
+                      self.config.codexEnabled,
+                      self.config.autoRedeemExpiringCodexResets
+                else { return false }
+                let settings = await UNUserNotificationCenter.current().notificationSettings()
+                return settings.authorizationStatus == .authorized ||
+                    settings.authorizationStatus == .provisional
+            }
+        } else {
+            finalAuthorizationCheck = nil
+        }
+
         let outcome = try await self.codexFetcher.consumeResetCredit(
             creditID: attempt.creditID,
             idempotencyKey: attempt.idempotencyKey,
-            automatic: automatic
+            finalAuthorizationCheck: finalAuthorizationCheck
         )
         self.pendingCodexResetRedemption = nil
         PendingCodexResetRedemptionStore.clear()

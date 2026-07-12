@@ -1,3 +1,4 @@
+import LLMUsageCore
 import Foundation
 
 struct AppConfig: Codable {

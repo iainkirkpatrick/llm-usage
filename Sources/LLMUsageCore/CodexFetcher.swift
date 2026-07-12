@@ -1,5 +1,4 @@
 import Foundation
-import UserNotifications
 
 private struct RPCRateLimitsResponse: Decodable {
     let rateLimits: RPCRateLimitSnapshot
@@ -54,7 +53,7 @@ private struct PiCodexAuthTokens: Sendable {
     let chatgptPlanType: String?
 }
 
-enum CodexFetchError: LocalizedError {
+public enum CodexFetchError: LocalizedError {
     case executableNotFound([String])
     case nodeNotFound([String])
     case launchFailed(String)
@@ -62,7 +61,7 @@ enum CodexFetchError: LocalizedError {
     case noData
     case autoRedemptionDisabled
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case let .executableNotFound(candidates):
             if candidates.isEmpty {
@@ -576,107 +575,55 @@ private struct PiCodexAuthFetcher {
     }
 }
 
-struct CodexFetcher {
-    func fetch() async throws -> CodexSnapshot {
+public struct CodexFetcher: Sendable {
+    public init() {}
+    public func fetch() async throws -> CodexSnapshot {
         let codexPath = try CodexRPCClient.resolvedCodexExecutablePath()
         let piAuthFetcher = PiCodexAuthFetcher()
 
-        do {
-            let initialTokens = try piAuthFetcher.fetchTokens()
-            let client = try CodexRPCClient(
-                codexPath: codexPath,
-                externalAuthTokenProvider: { _ in
-                    try piAuthFetcher.fetchTokens()
-                }
-            )
-            defer { client.shutdown() }
-
-            try await client.initialize()
-            try await client.loginWithChatGPTTokens(initialTokens)
-            let limits = try await client.fetchRateLimits()
-            AppLog.info("Codex Pi-auth fetch succeeded")
-            return try self.makeSnapshot(limits, sourceLabel: "Pi auth")
-        } catch PiCodexHelperAvailability.noAuth {
-            AppLog.info("Codex Pi auth unavailable; falling back to Codex CLI: no Pi Codex auth")
-        } catch PiCodexHelperAvailability.unavailable {
-            AppLog.info("Codex Pi auth unavailable; falling back to Codex CLI: bundled helper unavailable")
-        } catch CodexFetchError.nodeNotFound(let candidates) {
-            AppLog.info("Codex Pi auth unavailable; falling back to Codex CLI: Node.js executable was not found. Checked: \(candidates.joined(separator: ", ")).")
-        } catch {
-            AppLog.error("Codex Pi-auth fetch failed; not falling back to Codex CLI: \(error.localizedDescription)")
-            throw error
-        }
-
-        do {
-            let client = try CodexRPCClient(codexPath: codexPath)
-            defer { client.shutdown() }
-
-            try await client.initialize()
-            let limits = try await client.fetchRateLimits()
-            AppLog.info("Codex CLI fallback succeeded")
-            return try self.makeSnapshot(limits, sourceLabel: "Codex CLI")
-        } catch {
-            AppLog.error("Codex CLI fallback failed: \(error.localizedDescription)")
-            throw error
-        }
-    }
-
-    func consumeResetCredit(creditID: String, idempotencyKey: String, automatic: Bool = false) async throws -> String {
-        let codexPath = try CodexRPCClient.resolvedCodexExecutablePath()
-        let piAuthFetcher = PiCodexAuthFetcher()
-
-        do {
-            let initialTokens = try piAuthFetcher.fetchTokens()
-            let client = try CodexRPCClient(
-                codexPath: codexPath,
-                externalAuthTokenProvider: { _ in
-                    try piAuthFetcher.fetchTokens()
-                }
-            )
-            defer { client.shutdown() }
-
-            try await client.initialize()
-            try await client.loginWithChatGPTTokens(initialTokens)
-            if automatic {
-                let authorized = await Self.autoRedemptionStillAuthorized()
-                if !authorized {
-                    throw CodexFetchError.autoRedemptionDisabled
-                }
+        let initialTokens = try piAuthFetcher.fetchTokens()
+        let client = try CodexRPCClient(
+            codexPath: codexPath,
+            externalAuthTokenProvider: { _ in
+                try piAuthFetcher.fetchTokens()
             }
-            let outcome = try await client.consumeRateLimitResetCredit(idempotencyKey: idempotencyKey, creditID: creditID)
-            AppLog.info("Codex saved reset redemption completed via Pi auth: \(outcome)")
-            return outcome
-        } catch PiCodexHelperAvailability.noAuth {
-            AppLog.info("Codex Pi auth unavailable for saved reset redemption; falling back to Codex CLI")
-        } catch PiCodexHelperAvailability.unavailable {
-            AppLog.info("Codex Pi auth helper unavailable for saved reset redemption; falling back to Codex CLI")
-        } catch CodexFetchError.nodeNotFound {
-            AppLog.info("Node.js unavailable for Pi-backed saved reset redemption; falling back to Codex CLI")
-        } catch {
-            AppLog.error("Codex Pi-auth saved reset redemption failed; not falling back to Codex CLI: \(error.localizedDescription)")
-            throw error
-        }
-
-        let client = try CodexRPCClient(codexPath: codexPath)
+        )
         defer { client.shutdown() }
+
         try await client.initialize()
-        if automatic {
-            let authorized = await Self.autoRedemptionStillAuthorized()
-            if !authorized {
-                throw CodexFetchError.autoRedemptionDisabled
-            }
-        }
-        let outcome = try await client.consumeRateLimitResetCredit(idempotencyKey: idempotencyKey, creditID: creditID)
-        AppLog.info("Codex saved reset redemption completed via Codex CLI: \(outcome)")
-        return outcome
+        try await client.loginWithChatGPTTokens(initialTokens)
+        let limits = try await client.fetchRateLimits()
+        return try self.makeSnapshot(limits, sourceLabel: "Pi auth")
     }
 
-    private static func autoRedemptionStillAuthorized() async -> Bool {
-        let config = ConfigStore.load()
-        guard config.codexEnabled, config.autoRedeemExpiringCodexResets else { return false }
-        let settings = await UNUserNotificationCenter.current().notificationSettings()
-        return settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional
+    public func consumeResetCredit(
+        creditID: String,
+        idempotencyKey: String,
+        finalAuthorizationCheck: (@MainActor @Sendable () async -> Bool)? = nil
+    ) async throws -> String {
+        let codexPath = try CodexRPCClient.resolvedCodexExecutablePath()
+        let piAuthFetcher = PiCodexAuthFetcher()
+
+        let initialTokens = try piAuthFetcher.fetchTokens()
+        let client = try CodexRPCClient(
+            codexPath: codexPath,
+            externalAuthTokenProvider: { _ in
+                try piAuthFetcher.fetchTokens()
+            }
+        )
+        defer { client.shutdown() }
+
+        try await client.initialize()
+        try await client.loginWithChatGPTTokens(initialTokens)
+        if let finalAuthorizationCheck, !(await finalAuthorizationCheck()) {
+            throw CodexFetchError.autoRedemptionDisabled
+        }
+        return try await client.consumeRateLimitResetCredit(
+            idempotencyKey: idempotencyKey,
+            creditID: creditID
+        )
     }
+
 
     private func makeSnapshot(_ response: RPCRateLimitsResponse, sourceLabel: String) throws -> CodexSnapshot {
         let limits = response.rateLimits
