@@ -34,6 +34,7 @@ private struct RPCRateLimitResetCreditConsumeResponse: Decodable {
 private struct RPCRateLimitWindow: Decodable {
     let usedPercent: Double
     let resetsAt: Int?
+    let windowDurationMins: Int?
 }
 
 private struct RPCCreditsSnapshot: Decodable {
@@ -679,8 +680,7 @@ struct CodexFetcher {
 
     private func makeSnapshot(_ response: RPCRateLimitsResponse, sourceLabel: String) throws -> CodexSnapshot {
         let limits = response.rateLimits
-        let primary = limits.primary.map { self.makeWindow($0) }
-        let secondary = limits.secondary.map { self.makeWindow($0) }
+        let windows = self.classifyWindows(primary: limits.primary, secondary: limits.secondary)
         let credits = Double(limits.credits?.balance ?? "")
         let resetCredits = response.rateLimitResetCredits.map { summary in
             CodexResetCredits(
@@ -699,18 +699,59 @@ struct CodexFetcher {
             )
         }
 
-        guard primary != nil || secondary != nil else {
+        guard windows.session != nil || windows.weekly != nil else {
             throw CodexFetchError.noData
         }
 
         return CodexSnapshot(
-            session: primary,
-            weekly: secondary,
+            session: windows.session.map { self.makeWindow($0) },
+            weekly: windows.weekly.map { self.makeWindow($0) },
             creditsRemaining: credits,
             resetCredits: resetCredits,
             sourceLabel: sourceLabel,
             updatedAt: Date()
         )
+    }
+
+    private func classifyWindows(
+        primary: RPCRateLimitWindow?,
+        secondary: RPCRateLimitWindow?
+    ) -> (session: RPCRateLimitWindow?, weekly: RPCRateLimitWindow?) {
+        let candidates = [primary, secondary].compactMap { $0 }
+        var session = candidates.first { ($0.windowDurationMins ?? Int.max) < 24 * 60 }
+        var weekly = candidates.first { ($0.windowDurationMins ?? 0) >= 24 * 60 }
+
+        // Older app-server versions may omit the duration. Preserve the usual
+        // primary/secondary mapping when both windows exist. For a lone window,
+        // its reset horizon is the best available signal.
+        if session == nil, weekly == nil {
+            if let primary, let secondary {
+                session = primary
+                weekly = secondary
+            } else if let only = primary ?? secondary {
+                let resetAt = only.resetsAt.map { Date(timeIntervalSince1970: TimeInterval($0)) }
+                if let resetAt, resetAt.timeIntervalSinceNow > 24 * 60 * 60 {
+                    weekly = only
+                } else {
+                    session = only
+                }
+            }
+        } else {
+            let unclassified = candidates.filter { candidate in
+                candidate.windowDurationMins == nil
+            }
+            if session == nil {
+                session = unclassified.first
+            }
+            if weekly == nil {
+                weekly = unclassified.first { candidate in
+                    guard let session else { return true }
+                    return candidate.resetsAt != session.resetsAt || candidate.usedPercent != session.usedPercent
+                }
+            }
+        }
+
+        return (session, weekly)
     }
 
     private func makeWindow(_ window: RPCRateLimitWindow) -> RateWindow {
