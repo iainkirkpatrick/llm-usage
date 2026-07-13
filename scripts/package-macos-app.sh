@@ -12,12 +12,15 @@ npm run build
 swift build -c release --product LLMUsageBar
 bin_dir="$(swift build -c release --show-bin-path)"
 built_bin="$bin_dir/LLMUsageBar"
+built_app_bundle="$bin_dir/LLMUsageBar_LLMUsageBar.bundle"
 [ -x "$built_bin" ] || { echo "Built LLMUsageBar binary not found" >&2; exit 1; }
+[ -d "$built_app_bundle" ] || { echo "Built LLMUsageBar resource bundle not found" >&2; exit 1; }
 [ -f "$ROOT_DIR/dist-node/llm-usage.mjs" ] || { echo "Node bundle not found" >&2; exit 1; }
 
 rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR/$APP_NAME/Contents/MacOS" "$DIST_DIR/$APP_NAME/Contents/Resources"
 cp "$built_bin" "$DIST_DIR/$APP_NAME/Contents/MacOS/LLMUsageBar"
+cp -R "$built_app_bundle" "$DIST_DIR/$APP_NAME/Contents/Resources/LLMUsageBar_LLMUsageBar.bundle"
 cp "$ROOT_DIR/dist-node/llm-usage.mjs" "$DIST_DIR/$APP_NAME/Contents/Resources/llm-usage.mjs"
 cp "$ROOT_DIR/node/runtime-package.json" "$DIST_DIR/$APP_NAME/Contents/Resources/package.json"
 cp "$ROOT_DIR/Assets/AppIcon.icns" "$DIST_DIR/$APP_NAME/Contents/Resources/AppIcon.icns"
