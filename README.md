@@ -15,11 +15,11 @@ cd ~/Development/iainkirkpatrick/llm-usage
 swift run LLMUsageBar
 ```
 
-If you change the Pi-backed Codex helper, rebuild the bundled helper script first:
+The Codex core is the bundled Node CLI. Rebuild it after changing Node sources:
 
 ```bash
-npm install
-npm run build:pi-helper
+npm ci
+npm run build
 ```
 
 Installed app (via dotfiles, using GitHub Releases):
@@ -40,27 +40,26 @@ The installed launcher opens the menu bar app when run without arguments:
 llm-usage-bar
 ```
 
-Codex usage for agents and scripts is provided by the separate portable CLI. Keep its generated `LLMUsageCore` resource bundle alongside the executable when installing it:
+Codex usage for agents and scripts is provided by the bundled Node CLI. The macOS app bridge and the installed launcher both run `llm-usage.mjs`:
 
 ```bash
-swift run llm-usage codex
-swift run llm-usage codex --json
-swift run llm-usage diagnose
+./scripts/package-macos-app.sh
+./dist/LLM\ Usage.app/Contents/MacOS/llm-usage codex --json
 ```
 
-On Linux, install the release executable and its required resource directory together:
+On Linux, install the Node bundle and launcher (no Swift runtime is required):
 
 ```bash
 ./scripts/install-linux-cli.sh
 $HOME/bin/llm-usage codex --json
 ```
 
-Requirements are Swift 6, Node 20 or newer, a compatible local Codex executable providing `app-server`, and Pi-managed Codex authentication. Override the destination with `LLM_USAGE_INSTALL_DIR`.
+Requirements are Node 20 or newer, a compatible local Codex executable providing `app-server`, and Pi-managed Codex authentication. Override the destination with `LLM_USAGE_INSTALL_DIR`.
 
-Diagnostics check each enabled provider and print the app log location:
+The Node CLI can verify local Codex prerequisites:
 
 ```bash
-llm-usage-bar diagnose
+llm-usage diagnose
 ```
 
 Codex usage requires Pi-managed `openai-codex` authentication. The local Codex executable provides the app-server transport but its own login is not used.
@@ -91,11 +90,9 @@ Example:
 
 Codex rate limits and saved reset credits are fetched from the Codex app-server. When credits are available, the menu lists their expiry and offers an explicit, Cancel-by-default confirmation before spending one. The Settings menu can opt in to automatically redeem the specific earliest-expiring saved reset during its final hour; it sends local notifications at 24 hours, 6 hours, and after the redemption attempt.
 
-If Pi has an `openai-codex` OAuth login in `~/.pi/agent/auth.json`, the app prefers that Pi-managed auth for Codex session/weekly limits and falls back to the Codex CLI's own login when Pi auth is unavailable.
+If Pi has an `openai-codex` OAuth login in `~/.pi/agent/auth.json`, the bundled Node CLI supplies that auth to the local Codex app-server. Node must be discoverable from common paths, your login shell, or `LLM_BAR_NODE_PATH`.
 
-Pi-backed Codex fetching uses a bundled Node helper, so a `node` executable must be discoverable from your login shell or configured via `LLM_BAR_NODE_PATH`.
-
-The menu shows the active source as either **Pi auth** or **Codex CLI**.
+The menu shows the active source as **Pi auth**.
 
 Runtime refresh logs are written to `~/.llm-usage-bar/app.log`.
 

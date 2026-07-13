@@ -1,5 +1,6 @@
 .build/
 dist/
 node_modules/
-Sources/LLMUsageCore/Resources/codex-pi-helper.bundle.mjs
 .DS_Store
+
+dist-node/

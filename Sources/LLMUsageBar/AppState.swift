@@ -1,4 +1,3 @@
-import LLMUsageCore
 import Foundation
 import UserNotifications
 
@@ -58,7 +57,7 @@ final class AppState {
     private var pendingCodexResetRedemption: PendingCodexResetRedemption?
     private var codexResetRefreshRequired = false
 
-    private let codexFetcher = CodexFetcher()
+    private let codexFetcher = CodexNodeBridge()
     private let openCodeFetcher = OpenCodeGoFetcher()
     private let piFetcher = PiSessionsFetcher()
     private var config: AppConfig
@@ -135,25 +134,17 @@ final class AppState {
             self.pendingCodexResetRedemption = attempt
         }
 
-        let finalAuthorizationCheck: (@MainActor @Sendable () async -> Bool)?
+        // Keep policy authorization in the app, immediately before the irreversible CLI call.
         if automatic {
-            finalAuthorizationCheck = { [weak self] in
-                guard let self,
-                      self.config.codexEnabled,
-                      self.config.autoRedeemExpiringCodexResets
-                else { return false }
-                let settings = await UNUserNotificationCenter.current().notificationSettings()
-                return settings.authorizationStatus == .authorized ||
-                    settings.authorizationStatus == .provisional
-            }
-        } else {
-            finalAuthorizationCheck = nil
+            let settings = await UNUserNotificationCenter.current().notificationSettings()
+            guard self.config.codexEnabled,
+                  self.config.autoRedeemExpiringCodexResets,
+                  settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional
+            else { throw CodexResetRedemptionError.selectedCreditUnavailable }
         }
-
         let outcome = try await self.codexFetcher.consumeResetCredit(
             creditID: attempt.creditID,
-            idempotencyKey: attempt.idempotencyKey,
-            finalAuthorizationCheck: finalAuthorizationCheck
+            idempotencyKey: attempt.idempotencyKey
         )
         self.pendingCodexResetRedemption = nil
         PendingCodexResetRedemptionStore.clear()
