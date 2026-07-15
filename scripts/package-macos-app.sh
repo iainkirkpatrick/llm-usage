@@ -27,7 +27,16 @@ cp "$ROOT_DIR/Assets/AppIcon.icns" "$DIST_DIR/$APP_NAME/Contents/Resources/AppIc
 cat > "$DIST_DIR/$APP_NAME/Contents/MacOS/llm-usage" <<'LAUNCHER'
 #!/usr/bin/env bash
 set -euo pipefail
-root="$(cd "$(dirname "$0")/.." && pwd)"
+script="$0"
+while [ -L "$script" ]; do
+  script_dir="$(cd -P "$(dirname "$script")" && pwd)"
+  link_target="$(readlink "$script")"
+  case "$link_target" in
+    /*) script="$link_target" ;;
+    *) script="$script_dir/$link_target" ;;
+  esac
+done
+root="$(cd -P "$(dirname "$script")/.." && pwd)"
 home="${HOME:-$(eval echo ~)}"
 find_node() {
   local candidate
