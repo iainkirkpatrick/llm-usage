@@ -65,9 +65,9 @@ struct CodexNodeBridge: Sendable {
     }
 
     private func runJSON<T: Decodable & Sendable, Result: Sendable>(arguments: [String], transform: @escaping @Sendable (T) throws -> Result) async throws -> Result {
-        let node = try self.nodePath()
-        let script = try self.scriptURL()
-        return try await Task.detached {
+        try await Task.detached(priority: .utility) {
+            let node = try self.nodePath()
+            let script = try self.scriptURL()
             let result = try Self.runProcess(node: node, script: script, arguments: arguments)
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .custom { decoder in

@@ -159,9 +159,10 @@ final class AppState {
         }
     }
 
-    func refresh() async {
+    func refresh(onStart: () -> Void) async {
         guard !self.isRefreshing, !self.isRedeemingCodexReset else { return }
         self.isRefreshing = true
+        onStart()
         defer { self.isRefreshing = false }
 
         AppLog.info("Refresh started: codex=\(self.config.codexEnabled) openCode=\(self.config.openCodeEnabled) pi=\(self.config.piEnabled)")
@@ -198,10 +199,15 @@ final class AppState {
 
         if self.config.piEnabled {
             do {
-                piResult = try self.piFetcher.fetch(
-                    sessionsDirectory: self.config.piSessionsDirectory,
-                    deduplicateForkHistory: self.config.piDeduplicateForkHistory
-                )
+                let fetcher = self.piFetcher
+                let sessionsDirectory = self.config.piSessionsDirectory
+                let deduplicateForkHistory = self.config.piDeduplicateForkHistory
+                piResult = try await Task.detached(priority: .utility) {
+                    try fetcher.fetch(
+                        sessionsDirectory: sessionsDirectory,
+                        deduplicateForkHistory: deduplicateForkHistory
+                    )
+                }.value
                 AppLog.info("Pi refresh succeeded: sessions=\(piResult?.sessionCount ?? 0) rows=\(piResult?.rows.count ?? 0)")
             } catch {
                 let message = "Pi: \(error.localizedDescription)"

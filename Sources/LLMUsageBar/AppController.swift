@@ -69,7 +69,9 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     private func refreshAndUpdateMenu() async {
-        await self.state.refresh()
+        await self.state.refresh {
+            self.rebuildMenu()
+        }
         await self.handleExpiringCodexResets()
         self.rebuildMenu()
     }
@@ -177,8 +179,11 @@ final class AppController: NSObject, NSApplicationDelegate {
         titleItem.isEnabled = false
         menu.addItem(titleItem)
 
+        let updateStatus = self.state.isRefreshing
+            ? "Updating…"
+            : "Last updated: \(Formatting.lastUpdated(snapshot.updatedAt))"
         let updatedItem = NSMenuItem(
-            title: "Last updated: \(Formatting.lastUpdated(snapshot.updatedAt))",
+            title: updateStatus,
             action: nil,
             keyEquivalent: ""
         )
