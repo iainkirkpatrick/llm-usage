@@ -2,10 +2,21 @@ import AppKit
 import Foundation
 import UserNotifications
 
+private final class CodexResetSelection: NSObject {
+    let accountID: String
+    let creditID: String
+
+    init(accountID: String, creditID: String) {
+        self.accountID = accountID
+        self.creditID = creditID
+    }
+}
+
 @MainActor
 final class AppController: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var refreshTask: Task<Void, Never>?
+    private var managedLoginTask: Task<Void, Never>?
     private var state: AppState!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -36,6 +47,7 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         self.refreshTask?.cancel()
+        self.managedLoginTask?.cancel()
     }
 
     private func hasExistingInstance() -> Bool {
@@ -77,62 +89,74 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     private func handleExpiringCodexResets() async {
-        guard let resetCredits = self.state.snapshot.codex?.resetCredits else { return }
         let now = Date()
-        let expiringCredits = resetCredits.credits
-            .compactMap { credit -> (credit: CodexResetCredit, expiry: Date)? in
-                guard let expiry = credit.expiresAt, expiry > now else { return nil }
-                return (credit, expiry)
+        let expiringCredits: [(account: CodexAccountSnapshot, credit: CodexResetCredit, expiry: Date)] = self.state.snapshot.codexAccounts.flatMap { account in
+            guard let resetCredits = account.usage?.resetCredits else {
+                return [] as [(account: CodexAccountSnapshot, credit: CodexResetCredit, expiry: Date)]
             }
-            .sorted { $0.expiry < $1.expiry }
+            return resetCredits.credits.compactMap { credit in
+                guard let expiry = credit.expiresAt, expiry > now else { return nil }
+                return (account, credit, expiry)
+            }
+        }.sorted { $0.expiry < $1.expiry }
 
         for item in expiringCredits {
             let seconds = item.expiry.timeIntervalSince(now)
             let label = item.credit.title ?? item.credit.description ?? "Saved Codex reset"
+            let accountLabel = item.account.displayLabel
             if seconds <= 24 * 60 * 60 {
                 self.sendResetExpiryNotificationOnce(
-                    key: "\(item.credit.id):24h",
+                    key: "\(item.account.id):\(item.credit.id):24h",
                     title: "Codex reset expires soon",
-                    body: "\(label) expires in \(Formatting.relativeReset(item.expiry))."
+                    body: "\(accountLabel): \(label) expires in \(Formatting.relativeReset(item.expiry))."
                 )
             }
             if seconds <= 6 * 60 * 60 {
                 self.sendResetExpiryNotificationOnce(
-                    key: "\(item.credit.id):6h",
+                    key: "\(item.account.id):\(item.credit.id):6h",
                     title: "Codex reset expires in \(Formatting.relativeReset(item.expiry))",
-                    body: "\(label) is still available."
+                    body: "\(accountLabel): \(label) is still available."
                 )
             }
         }
 
+        // Auto-redemption is deliberately scoped to the explicitly selected account. With multiple
+        // managed homes this prevents a credit from one account being spent through another home.
         guard self.state.currentConfig.autoRedeemExpiringCodexResets,
               self.state.canRedeemCodexResets,
               await self.notificationsAuthorized(),
-              let candidate = expiringCredits.first,
+              let candidate = expiringCredits.first(where: {
+                  $0.account.id == self.state.primaryCodexAccountKey &&
+                      $0.credit.status?.lowercased() == "available" &&
+                      self.state.canRedeemCodexReset(accountID: $0.account.id, creditID: $0.credit.id)
+              }),
               candidate.expiry.timeIntervalSince(now) <= 60 * 60,
-              self.claimAutoRedemptionAttempt(for: candidate.credit.id, now: now)
+              self.claimAutoRedemptionAttempt(accountID: candidate.account.id, creditID: candidate.credit.id, now: now)
         else {
             return
         }
 
         do {
-            let result = try await self.state.consumeCodexResetCredit(creditID: candidate.credit.id, automatic: true)
+            let result = try await self.state.consumeCodexResetCredit(
+                accountID: candidate.account.id,
+                creditID: candidate.credit.id,
+                automatic: true)
             let label = candidate.credit.title ?? candidate.credit.description ?? "Saved Codex reset"
             let body: String
             switch result.outcome {
             case "reset", "alreadyRedeemed", "already_redeemed":
-                body = "\(label) was redeemed automatically before expiry."
+                body = "\(candidate.account.displayLabel): \(label) was redeemed automatically before expiry."
             default:
-                body = "\(label) was not redeemed automatically (\(result.outcome))."
+                body = "\(candidate.account.displayLabel): \(label) was not redeemed automatically (\(result.outcome))."
             }
             self.sendResetExpiryNotificationOnce(
-                key: "\(candidate.credit.id):auto",
+                key: "\(candidate.account.id):\(candidate.credit.id):auto",
                 title: "Codex expiring reset checked",
                 body: body
             )
         } catch {
             self.sendResetExpiryNotificationOnce(
-                key: "\(candidate.credit.id):auto-error",
+                key: "\(candidate.account.id):\(candidate.credit.id):auto-error",
                 title: "Could not auto-use Codex reset",
                 body: error.localizedDescription
             )
@@ -153,8 +177,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         return settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional
     }
 
-    private func claimAutoRedemptionAttempt(for creditID: String, now: Date) -> Bool {
-        let storageKey = "codex-reset-auto-redemption-attempt"
+    private func claimAutoRedemptionAttempt(accountID: String, creditID: String, now: Date) -> Bool {
+        let storageKey = "codex-reset-auto-redemption-attempt-\(accountID)"
         if let timestamp = UserDefaults.standard.object(forKey: storageKey) as? Date,
            now.timeIntervalSince(timestamp) < 24 * 60 * 60 {
             return false
@@ -228,28 +252,67 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     private func addCodexSection(to menu: NSMenu, snapshot: AppSnapshot) {
-        let header = NSMenuItem(title: "Codex", action: nil, keyEquivalent: "")
+        let header = NSMenuItem(title: "Codex accounts", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
 
-        guard let codex = snapshot.codex else {
-            menu.addItem(self.disabledItem("No data"))
+        var accounts = snapshot.codexAccounts
+        if accounts.isEmpty {
+            // Show configured managed profiles immediately while the first refresh or login is in flight.
+            accounts = self.state.managedCodexAccounts.map {
+                CodexAccountSnapshot(
+                    id: $0.id.uuidString,
+                    label: $0.label,
+                    email: $0.email,
+                    usage: nil,
+                    error: nil)
+            }
+        }
+
+        guard !accounts.isEmpty else {
+            menu.addItem(self.disabledItem("No managed Codex accounts configured."))
+            let add = NSMenuItem(title: "Add a managed Codex account…", action: #selector(self.addManagedCodexAccount), keyEquivalent: "")
+            add.target = self
+            add.isEnabled = !self.state.isCodexAccountOperationInProgress
+            menu.addItem(add)
+            return
+        }
+
+        for (index, account) in accounts.enumerated() {
+            if index > 0 { menu.addItem(.separator()) }
+            self.addCodexAccountSection(to: menu, account: account)
+        }
+    }
+
+    private func addCodexAccountSection(to menu: NSMenu, account: CodexAccountSnapshot) {
+        let header = NSMenuItem(title: "Managed Codex — \(account.displayLabel)", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+
+        guard let codex = account.usage else {
+            if let id = UUID(uuidString: account.id),
+               self.state.authenticatingCodexAccountID == id
+            {
+                menu.addItem(self.disabledItem("Signing in… complete the Codex OAuth flow in your browser."))
+            } else if let error = account.error {
+                menu.addItem(self.disabledItem("Unavailable: \(self.truncated(error, limit: 100))"))
+            } else {
+                menu.addItem(self.disabledItem("No data yet"))
+            }
             return
         }
 
         let session = NSMenuItem(
             title: "Session left: \(Formatting.percent(codex.session?.remainingPercent)) (resets in \(Formatting.relativeReset(codex.session?.resetAt)))",
             action: nil,
-            keyEquivalent: ""
-        )
+            keyEquivalent: "")
         session.isEnabled = false
         menu.addItem(session)
 
         let weekly = NSMenuItem(
             title: "Weekly left: \(Formatting.percent(codex.weekly?.remainingPercent)) (resets in \(Formatting.relativeReset(codex.weekly?.resetAt)))",
             action: nil,
-            keyEquivalent: ""
-        )
+            keyEquivalent: "")
         weekly.isEnabled = false
         menu.addItem(weekly)
 
@@ -266,28 +329,35 @@ final class AppController: NSObject, NSApplicationDelegate {
 
             if resetCredits.availableCount == 0 {
                 resetMenu.addItem(self.disabledItem("No saved resets"))
-            } else {
-                if resetCredits.credits.isEmpty {
-                    resetMenu.addItem(self.disabledItem("Details unavailable; redemption is disabled to avoid spending an unspecified reset."))
-                } else if self.state.canRedeemCodexResets {
-                    for credit in resetCredits.credits {
-                        let label = credit.title ?? credit.description ?? "Saved usage-limit reset"
-                        let expiry = Formatting.dateTime(credit.expiresAt)
+            } else if resetCredits.credits.isEmpty {
+                resetMenu.addItem(self.disabledItem("Details unavailable; redemption is disabled to avoid spending an unspecified reset."))
+            } else if self.state.canRedeemCodexResets(for: account.id) {
+                for credit in resetCredits.credits {
+                    let label = credit.title ?? credit.description ?? "Saved usage-limit reset"
+                    let expiry = Formatting.dateTime(credit.expiresAt)
+                    if self.state.canRedeemCodexReset(accountID: account.id, creditID: credit.id) {
                         let useReset = NSMenuItem(title: "Use: \(label) — expires \(expiry)…", action: #selector(self.useSavedReset), keyEquivalent: "")
                         useReset.target = self
-                        useReset.representedObject = credit.id
+                        useReset.representedObject = CodexResetSelection(accountID: account.id, creditID: credit.id)
                         resetMenu.addItem(useReset)
+                    } else {
+                        resetMenu.addItem(self.disabledItem("Pending reset: retry the same saved reset first"))
                     }
-                } else {
-                    resetMenu.addItem(.separator())
-                    resetMenu.addItem(self.disabledItem("Refresh Codex usage successfully before using another reset."))
                 }
+            } else {
+                resetMenu.addItem(.separator())
+                resetMenu.addItem(self.disabledItem("Refresh this Codex account successfully before using another reset."))
             }
 
             resetItem.submenu = resetMenu
             menu.addItem(resetItem)
         }
 
+        if let email = account.email ?? codex.email {
+            let identity = NSMenuItem(title: "Identity: \(email)", action: nil, keyEquivalent: "")
+            identity.isEnabled = false
+            menu.addItem(identity)
+        }
         let source = NSMenuItem(title: "Source: \(codex.sourceLabel)", action: nil, keyEquivalent: "")
         source.isEnabled = false
         menu.addItem(source)
@@ -444,6 +514,49 @@ final class AppController: NSObject, NSApplicationDelegate {
         autoRedeemResetsToggle.state = config.autoRedeemExpiringCodexResets ? .on : .off
         autoRedeemResetsToggle.isEnabled = config.codexEnabled
         settingsMenu.addItem(autoRedeemResetsToggle)
+
+        let managedAccountsItem = NSMenuItem(title: "Managed Codex accounts", action: nil, keyEquivalent: "")
+        let managedAccountsMenu = NSMenu(title: "Managed Codex accounts")
+        let addManagedAccount = NSMenuItem(title: "Add Codex account…", action: #selector(self.addManagedCodexAccount), keyEquivalent: "")
+        addManagedAccount.target = self
+        addManagedAccount.isEnabled = !self.state.isCodexAccountOperationInProgress
+        managedAccountsMenu.addItem(addManagedAccount)
+
+        if self.state.isAuthenticatingCodexAccount {
+            let cancelLogin = NSMenuItem(title: "Cancel Codex sign-in", action: #selector(self.cancelManagedCodexLogin), keyEquivalent: "")
+            cancelLogin.target = self
+            managedAccountsMenu.addItem(cancelLogin)
+        }
+
+        managedAccountsMenu.addItem(.separator())
+        for profile in self.state.managedCodexAccounts {
+            let accountItem = NSMenuItem(title: profile.email.map { "\(profile.label) — \($0)" } ?? profile.label, action: nil, keyEquivalent: "")
+            let accountMenu = NSMenu(title: profile.label)
+
+            let select = NSMenuItem(title: "Use for menu-bar glyph", action: #selector(self.selectCodexPrimaryAccount(_:)), keyEquivalent: "")
+            select.target = self
+            select.representedObject = profile.id
+            select.state = self.state.primaryCodexAccountKey == profile.id.uuidString ? .on : .off
+            select.isEnabled = !self.state.isCodexAccountOperationInProgress
+            accountMenu.addItem(select)
+
+            let reauthenticate = NSMenuItem(title: "Sign in again…", action: #selector(self.reauthenticateManagedCodexAccount(_:)), keyEquivalent: "")
+            reauthenticate.target = self
+            reauthenticate.representedObject = profile.id
+            reauthenticate.isEnabled = !self.state.isCodexAccountOperationInProgress
+            accountMenu.addItem(reauthenticate)
+
+            let remove = NSMenuItem(title: "Remove account…", action: #selector(self.removeManagedCodexAccount(_:)), keyEquivalent: "")
+            remove.target = self
+            remove.representedObject = profile.id
+            remove.isEnabled = !self.state.isCodexAccountOperationInProgress
+            accountMenu.addItem(remove)
+
+            accountItem.submenu = accountMenu
+            managedAccountsMenu.addItem(accountItem)
+        }
+        managedAccountsItem.submenu = managedAccountsMenu
+        settingsMenu.addItem(managedAccountsItem)
 
         // OpenCode Go settings remain implemented but are intentionally hidden until needed again.
         let piToggle = NSMenuItem(title: "Enable Pi", action: #selector(self.togglePiEnabled), keyEquivalent: "")
@@ -647,17 +760,13 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     @objc private func useSavedReset(_ sender: NSMenuItem) {
-        guard let resetCredits = self.state.snapshot.codex?.resetCredits,
-              resetCredits.availableCount > 0
+        guard let selection = sender.representedObject as? CodexResetSelection,
+              let account = self.state.snapshot.codexAccounts.first(where: { $0.id == selection.accountID }),
+              let resetCredits = account.usage?.resetCredits,
+              resetCredits.availableCount > 0,
+              let selectedCredit = resetCredits.credits.first(where: { $0.id == selection.creditID })
         else {
-            self.showAlert(title: "No saved reset available", message: "Refresh Codex usage and try again.", style: .warning)
-            return
-        }
-
-        guard let creditID = sender.representedObject as? String,
-              let selectedCredit = resetCredits.credits.first(where: { $0.id == creditID })
-        else {
-            self.showAlert(title: "Saved reset is no longer available", message: "Refresh Codex usage and choose a current reset.", style: .warning)
+            self.showAlert(title: "Saved reset is no longer available", message: "Refresh the selected Codex account and choose a current reset.", style: .warning)
             return
         }
 
@@ -667,7 +776,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Use saved Codex reset?"
-        alert.informativeText = "This will spend one saved reset to refresh your Codex rate-limit windows. This cannot be undone.\n\nSelected: \(label).\(expiry)"
+        alert.informativeText = "This will spend one saved reset on the selected Codex account. This cannot be undone.\n\nAccount: \(account.displayLabel)\nSelected: \(label).\(expiry)"
         alert.addButton(withTitle: "Cancel")
         alert.addButton(withTitle: "Use reset")
         NSRunningApplication.current.activate()
@@ -677,7 +786,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         Task { [weak self] in
             guard let self else { return }
             do {
-                let result = try await self.state.consumeCodexResetCredit(creditID: creditID)
+                let result = try await self.state.consumeCodexResetCredit(
+                    accountID: selection.accountID,
+                    creditID: selection.creditID)
                 self.rebuildMenu()
                 self.showResetOutcome(result)
             } catch {
@@ -702,6 +813,117 @@ final class AppController: NSObject, NSApplicationDelegate {
             self.showAlert(title: "No saved reset available", message: "The available reset credits changed before redemption.\(refreshNote)", style: .warning)
         default:
             self.showAlert(title: "Saved reset was not applied", message: "Codex returned: \(result.outcome).\(refreshNote)", style: .warning)
+        }
+    }
+
+    @objc private func addManagedCodexAccount() {
+        let defaultLabel = "Codex account \(self.state.managedCodexAccounts.count + 1)"
+        guard let label = self.promptForValue(
+            title: "Add managed Codex account",
+            message: "Choose a label. Credentials will be stored only in this app's isolated CODEX_HOME.",
+            defaultValue: defaultLabel,
+            placeholder: "Personal, work, …")
+        else { return }
+
+        do {
+            let profile = try self.state.createManagedCodexAccount(label: label)
+            self.showAlert(
+                title: "Sign in to \(profile.label)",
+                message: "Codex's OAuth login will open in your browser. If it only prints a safe OpenAI sign-in URL, LLM Usage Bar will open that URL for you. Complete it there, then return to LLM Usage Bar.")
+            self.startManagedCodexLogin(accountID: profile.id, isNewAccount: true)
+        } catch {
+            self.showAlert(title: "Could not add Codex account", message: error.localizedDescription, style: .warning)
+        }
+    }
+
+    @objc private func cancelManagedCodexLogin() {
+        self.managedLoginTask?.cancel()
+    }
+
+    @objc private func selectCodexPrimaryAccount(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID else { return }
+        self.state.selectPrimaryCodexAccount(id)
+        self.rebuildMenu()
+        // The selected account is part of the data source, not just menu presentation. Refresh it
+        // immediately so the glyph and reset controls cannot continue showing another account.
+        Task { [weak self] in
+            await self?.refreshAndUpdateMenu()
+        }
+    }
+
+    @objc private func reauthenticateManagedCodexAccount(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let profile = self.state.managedCodexAccounts.first(where: { $0.id == id })
+        else { return }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Sign in to \(profile.label) again?"
+        alert.informativeText = "This will update the credentials in this account's isolated CODEX_HOME. Other managed accounts will not be changed."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Sign in again")
+        NSRunningApplication.current.activate()
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        self.startManagedCodexLogin(accountID: id, isNewAccount: false)
+    }
+
+    @objc private func removeManagedCodexAccount(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let profile = self.state.managedCodexAccounts.first(where: { $0.id == id })
+        else { return }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Remove \(profile.label)?"
+        alert.informativeText = "This permanently deletes this managed Codex account's isolated CODEX_HOME and its credentials. This cannot be undone."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Remove account")
+        NSRunningApplication.current.activate()
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+
+        do {
+            try self.state.removeManagedCodexAccount(id: id)
+            self.rebuildMenu()
+            Task { [weak self] in await self?.refreshAndUpdateMenu() }
+        } catch {
+            self.showAlert(title: "Could not remove Codex account", message: error.localizedDescription, style: .warning)
+        }
+    }
+
+    private func startManagedCodexLogin(accountID: UUID, isNewAccount: Bool) {
+        guard self.managedLoginTask == nil else {
+            self.showAlert(title: "Codex sign-in already in progress", message: "Wait for the current sign-in to finish.", style: .warning)
+            return
+        }
+        self.rebuildMenu()
+        self.managedLoginTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.state.authenticateManagedCodexAccount(id: accountID)
+                if self.state.managedCodexAccounts.contains(where: { $0.id == accountID }) {
+                    self.showAlert(
+                        title: isNewAccount ? "Codex account added" : "Codex account updated",
+                        message: "Usage will appear after the account refresh completes.")
+                }
+                await self.refreshAndUpdateMenu()
+            } catch {
+                let cancelled: Bool = if let managedError = error as? ManagedCodexAccountError,
+                                         case let .loginFailed(result) = managedError,
+                                         result.outcome == .cancelled
+                {
+                    true
+                } else {
+                    false
+                }
+                if !cancelled {
+                    self.showAlert(title: "Codex sign-in failed", message: error.localizedDescription, style: .warning)
+                }
+                self.rebuildMenu()
+            }
+            self.managedLoginTask = nil
+            self.rebuildMenu()
         }
     }
 

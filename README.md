@@ -19,7 +19,7 @@ The Codex core is the bundled Node CLI. Rebuild it after changing Node sources:
 
 ```bash
 npm ci
-npm run build
+npm run build # refreshes the ignored dist-node/llm-usage.mjs bundle used by the app
 ```
 
 Installed app (via dotfiles, using GitHub Releases):
@@ -54,15 +54,19 @@ On Linux, install the Node bundle and launcher (no Swift runtime is required):
 $HOME/bin/llm-usage codex --json
 ```
 
-Requirements are Node 20 or newer, a compatible local Codex executable providing `app-server`, and Pi-managed Codex authentication. Override the destination with `LLM_USAGE_INSTALL_DIR`.
+Requirements are Node 20 or newer and a compatible local Codex executable providing `app-server`. The standalone CLI keeps its existing Pi-managed Codex compatibility path; the macOS app uses only accounts added under Managed Codex accounts. Override the destination with `LLM_USAGE_INSTALL_DIR`.
 
-The Node CLI can verify local Codex prerequisites:
+The Node CLI can verify local Codex prerequisites without starting an app-server or printing credentials:
 
 ```bash
 llm-usage diagnose
 ```
 
-Codex usage requires Pi-managed `openai-codex` authentication. The local Codex executable provides the app-server transport but its own login is not used.
+`diagnose` reports the executable, whether a Pi OAuth credential is actually present, and the number of managed profiles. It works for managed-only installations; `Pi auth: unavailable` is expected when Pi is not installed. With no managed accounts, `llm-usage codex --json` keeps the existing Pi-managed `openai-codex` behavior. When the app has managed profiles, `llm-usage codex --all-managed --json` returns a backward-compatible selected `codex` object plus a `codexAccounts` array with per-account usage or errors. An explicit isolated home can be queried with:
+
+```bash
+llm-usage codex --codex-home "$HOME/.llm-usage-bar/codex-accounts/<profile-id>" --json
+```
 
 ## Config
 
@@ -74,8 +78,10 @@ Example:
 
 ```json
 {
-  "codexEnabled" : true,
   "autoRedeemExpiringCodexResets" : false,
+  "codexEnabled" : true,
+  "codexManagedAccounts" : [],
+  "codexPrimaryAccountID" : null,
   "openCodeCookieHeader" : null,
   "openCodeEnabled" : true,
   "openCodeWorkspaceID" : null,
@@ -88,11 +94,21 @@ Example:
 
 ### Codex setup
 
-Codex rate limits and saved reset credits are fetched from the Codex app-server. When credits are available, the menu lists their expiry and offers an explicit, Cancel-by-default confirmation before spending one. The Settings menu can opt in to automatically redeem the specific earliest-expiring saved reset during its final hour; it sends local notifications at 24 hours, 6 hours, and after the redemption attempt.
+Codex rate limits and saved reset credits are fetched from the Codex app-server. When credits are available, each account section lists its expiry and offers an explicit, Cancel-by-default confirmation before spending one. The Settings menu can opt in to automatically redeem the specific earliest-expiring saved reset during its final hour, but auto-redemption is scoped to the explicitly selected menu-bar account and fails closed if that account is not current. It sends local notifications at 24 hours, 6 hours, and after the redemption attempt.
 
-If Pi has an `openai-codex` OAuth login in `~/.pi/agent/auth.json`, the bundled Node CLI supplies that auth to the local Codex app-server. Node must be discoverable from common paths, your login shell, or `LLM_BAR_NODE_PATH`.
+With no managed accounts, the app displays a prompt to add one and does not fetch Codex usage.
 
-The menu shows the active source as **Pi auth**.
+### Managed Codex accounts
+
+Use **Settings → Managed Codex accounts → Add Codex account…** to add more than one Codex OAuth account. LLM Usage Bar creates an app-owned home for each profile under:
+
+`~/.llm-usage-bar/codex-accounts/<profile-id>/`
+
+The profile label and identity metadata are stored in `config.json`; credentials stay in that profile's `auth.json`. Homes are restricted to the owning user and `auth.json` is restricted to mode `0600`. Login runs the installed `codex login` in a temporary staging `CODEX_HOME`; only a validated ChatGPT OAuth `auth.json` is atomically installed after a successful login. Cancellation, validation failure, and CLI failure leave the previous live credentials untouched. If the CLI prints an OpenAI HTTPS OAuth URL instead of opening a browser, the app safely opens that URL without displaying bearer/JWT tokens. Usage then launches `codex app-server` with the same managed `CODEX_HOME`, calls native `account/read` and `account/rateLimits/read`, and keeps session/weekly limits independent for every account. Removing an account uses a recoverable home quarantine and commits metadata only when credential cleanup can be completed; failures are reported rather than hidden.
+
+The menu shows only managed accounts as labelled Codex sections. The first managed account becomes primary; selecting an unavailable account fails closed rather than switching to another account. Managed flows never read or write Pi auth or the user's default Codex credentials.
+
+Node must be discoverable from common paths, your login shell, or `LLM_BAR_NODE_PATH`.
 
 Runtime refresh logs are written to `~/.llm-usage-bar/app.log`.
 
@@ -136,7 +152,7 @@ If no manual cookie is configured, the fetcher also attempts a Chromium/Chrome c
 
 ## Environment overrides
 
-You can also run with env vars:
+You can also run with env vars. These values affect the current process only: unrelated UI and managed-account saves preserve the corresponding values already stored on disk, including managed-account metadata.
 
 - `LLM_BAR_CODEX_PATH`
 - `LLM_BAR_NODE_PATH`
@@ -163,4 +179,4 @@ swift run LLMUsageBar
 ## Notes
 
 - OpenCode usage-history access currently relies on internal web server-function endpoints used by the OpenCode web UI.
-- If OpenCode changes those endpoints, this app will need updates.
+- Managed Codex accounts use the installed Codex CLI and app-server; LLM Usage Bar does not shell out to CodexBar.

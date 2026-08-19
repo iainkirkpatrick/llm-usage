@@ -34,6 +34,43 @@ struct CodexSnapshot: Sendable {
     let resetCredits: CodexResetCredits?
     let sourceLabel: String
     let updatedAt: Date
+    let email: String?
+    let planType: String?
+
+    init(
+        session: RateWindow?,
+        weekly: RateWindow?,
+        creditsRemaining: Double?,
+        resetCredits: CodexResetCredits?,
+        sourceLabel: String,
+        updatedAt: Date,
+        email: String? = nil,
+        planType: String? = nil)
+    {
+        self.session = session
+        self.weekly = weekly
+        self.creditsRemaining = creditsRemaining
+        self.resetCredits = resetCredits
+        self.sourceLabel = sourceLabel
+        self.updatedAt = updatedAt
+        self.email = email
+        self.planType = planType
+    }
+}
+
+struct CodexAccountSnapshot: Sendable {
+    let id: String
+    let label: String
+    let email: String?
+    let usage: CodexSnapshot?
+    let error: String?
+
+    var displayLabel: String {
+        if let email, !email.isEmpty, email.caseInsensitiveCompare(self.label) != .orderedSame {
+            return "\(self.label) — \(email)"
+        }
+        return self.label
+    }
 }
 
 struct OpenCodeGoLimits: Sendable {
@@ -161,8 +198,25 @@ struct PiSnapshot: Sendable {
 
 struct AppSnapshot: Sendable {
     let codex: CodexSnapshot?
+    let codexAccounts: [CodexAccountSnapshot]
     let openCode: OpenCodeSnapshot?
     let pi: PiSnapshot?
     let errors: [String]
     let updatedAt: Date
+
+    init(
+        codex: CodexSnapshot?,
+        codexAccounts: [CodexAccountSnapshot] = [],
+        openCode: OpenCodeSnapshot?,
+        pi: PiSnapshot?,
+        errors: [String],
+        updatedAt: Date)
+    {
+        self.codex = codex
+        self.codexAccounts = codexAccounts
+        self.openCode = openCode
+        self.pi = pi
+        self.errors = errors
+        self.updatedAt = updatedAt
+    }
 }

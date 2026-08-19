@@ -15,8 +15,8 @@ enum AppLog {
 
     private static func write(_ level: String, _ message: String) {
         do {
-            let directory = self.fileURL.deletingLastPathComponent()
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try ConfigStore.ensureAppDirectory()
+            try ConfigStore.validateAppOwnedFile(self.fileURL)
             self.truncateIfNeeded(maxBytes: 256 * 1024)
 
             let timestamp = ISO8601DateFormatter().string(from: Date())
@@ -24,15 +24,14 @@ enum AppLog {
             let data = Data(line.utf8)
 
             if FileManager.default.fileExists(atPath: self.fileURL.path) {
+                try AppOwnedPathSafety.hardenRegularFile(at: self.fileURL, permissions: 0o600)
                 let handle = try FileHandle(forWritingTo: self.fileURL)
                 try handle.seekToEnd()
                 try handle.write(contentsOf: data)
                 try handle.close()
             } else {
                 try data.write(to: self.fileURL, options: [.atomic])
-                try FileManager.default.setAttributes([
-                    .posixPermissions: NSNumber(value: Int16(0o600)),
-                ], ofItemAtPath: self.fileURL.path)
+                try AppOwnedPathSafety.hardenRegularFile(at: self.fileURL, permissions: 0o600)
             }
         } catch {
             // Logging must never affect refresh behavior.
