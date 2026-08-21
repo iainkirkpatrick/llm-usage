@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${1:-${VERSION:-0.1.0}}"
+VERSION="${1:-${VERSION:-0.2.1}}"
 DIST_DIR="$ROOT_DIR/dist"
 APP_NAME="LLM Usage.app"
 ARCHIVE_NAME="LLM-Usage-macos.tar.gz"

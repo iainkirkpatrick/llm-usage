@@ -239,7 +239,9 @@ class RPC {
   constructor(pathToCodex, { tokens = null, codexHome = null } = {}) {
     const env = { ...process.env };
     if (codexHome) env.CODEX_HOME = codexHome;
-    this.child = spawn(pathToCodex, ["-s", "read-only", "-a", "untrusted", "app-server"], { env, stdio: ["pipe", "pipe", "pipe"] });
+    // Current Codex releases accept `on-request` or `never`; older releases used
+    // `untrusted`. Usage requests are read-only and non-interactive, so never ask.
+    this.child = spawn(pathToCodex, ["-s", "read-only", "-a", "never", "app-server"], { env, stdio: ["pipe", "pipe", "pipe"] });
     this.lines = createInterface({ input: this.child.stdout });
     this.id = 0;
     this.tokens = tokens;

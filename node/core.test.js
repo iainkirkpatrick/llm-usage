@@ -38,9 +38,11 @@ test("managed fetch uses native app-server auth in the supplied CODEX_HOME", asy
   const executable = path.join(root, "fake-codex.sh");
   const script = path.join(root, "fake-codex.mjs");
   const log = path.join(root, "rpc.log");
+  const argsLog = path.join(root, "args.log");
   fs.writeFileSync(script, `import fs from "node:fs";
 import readline from "node:readline";
 const log = ${JSON.stringify(log)};
+fs.writeFileSync(${JSON.stringify(argsLog)}, JSON.stringify(process.argv.slice(2)));
 const home = process.env.CODEX_HOME;
 const lines = readline.createInterface({ input: process.stdin });
 lines.on("line", line => {
@@ -65,6 +67,7 @@ exec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)} "$@"
     assert.equal(output.codex.source, "Managed Codex");
     assert.equal(output.codex.email, "managed@example.com");
     assert.equal(output.codex.session.remainingPercent, 90);
+    assert.deepEqual(JSON.parse(fs.readFileSync(argsLog, "utf8")), ["-s", "read-only", "-a", "never", "app-server"]);
     const calls = fs.readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));
     assert.deepEqual(calls.map(call => call.method), ["initialize", "account/read", "account/rateLimits/read"]);
     assert.ok(calls.every(call => call.home.endsWith("managed-home")));
