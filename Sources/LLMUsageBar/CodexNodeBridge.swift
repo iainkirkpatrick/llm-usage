@@ -362,7 +362,8 @@ struct CodexNodeBridge: Sendable {
         }
         if let bundled = Bundle.main.resourceURL?.appendingPathComponent("llm-usage.mjs"),
            FileManager.default.isReadableFile(atPath: bundled.path) { return bundled }
-        if let bundled = Bundle.module.url(forResource: "llm-usage", withExtension: "mjs") { return bundled }
+        // Do not access SwiftPM's generated Bundle.module accessor here: it traps rather than
+        // returning nil when a packaged resource bundle is absent or uses a flat CI layout.
         // Development runs use the generated bundle before an app is packaged.
         let source = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("dist-node/llm-usage.mjs")

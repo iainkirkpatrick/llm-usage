@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${1:-${VERSION:-0.2.1}}"
+VERSION="${1:-${VERSION:-0.2.2}}"
 DIST_DIR="$ROOT_DIR/dist"
 APP_NAME="LLM Usage.app"
 ARCHIVE_NAME="LLM-Usage-macos.tar.gz"
@@ -21,6 +21,11 @@ rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR/$APP_NAME/Contents/MacOS" "$DIST_DIR/$APP_NAME/Contents/Resources"
 cp "$built_bin" "$DIST_DIR/$APP_NAME/Contents/MacOS/LLMUsageBar"
 cp -R "$built_app_bundle" "$DIST_DIR/$APP_NAME/Contents/Resources/LLMUsageBar_LLMUsageBar.bundle"
+# Keep provider icons directly in the app resource directory as well. SwiftPM resource bundle
+# layouts differ across Xcode/Swift versions (flat vs Contents/Resources); direct copies make the
+# packaged app independent of that implementation detail.
+cp "$ROOT_DIR/Sources/LLMUsageBar/Resources/ProviderIcon-codex.svg" "$DIST_DIR/$APP_NAME/Contents/Resources/ProviderIcon-codex.svg"
+cp "$ROOT_DIR/Sources/LLMUsageBar/Resources/ProviderIcon-opencode.svg" "$DIST_DIR/$APP_NAME/Contents/Resources/ProviderIcon-opencode.svg"
 cp "$ROOT_DIR/dist-node/llm-usage.mjs" "$DIST_DIR/$APP_NAME/Contents/Resources/llm-usage.mjs"
 cp "$ROOT_DIR/node/runtime-package.json" "$DIST_DIR/$APP_NAME/Contents/Resources/package.json"
 cp "$ROOT_DIR/Assets/AppIcon.icns" "$DIST_DIR/$APP_NAME/Contents/Resources/AppIcon.icns"

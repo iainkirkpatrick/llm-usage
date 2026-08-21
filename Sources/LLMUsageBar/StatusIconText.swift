@@ -151,12 +151,33 @@ enum StatusIconText {
     }
 
     private static func loadTemplateImage(named name: String) -> NSImage? {
-        guard let url = Bundle.module.url(forResource: name, withExtension: "svg"),
+        let filename = "\(name).svg"
+        let bundleName = "LLMUsageBar_LLMUsageBar.bundle"
+        var candidates: [URL] = []
+
+        if let resources = Bundle.main.resourceURL {
+            candidates.append(resources.appendingPathComponent(filename))
+            candidates.append(resources.appendingPathComponent(bundleName).appendingPathComponent(filename))
+            candidates.append(resources.appendingPathComponent(bundleName)
+                .appendingPathComponent("Contents/Resources").appendingPathComponent(filename))
+        }
+        if let executableDirectory = Bundle.main.executableURL?.deletingLastPathComponent() {
+            candidates.append(executableDirectory.appendingPathComponent(bundleName).appendingPathComponent(filename))
+        }
+
+        // SwiftPM's generated Bundle.module accessor traps when a release artifact contains a
+        // flat resource bundle without Info.plist. Search known layouts directly so a missing icon
+        // degrades to the text title instead of terminating the menu-bar app.
+        let sourceResource = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Resources")
+            .appendingPathComponent(filename)
+        candidates.append(sourceResource)
+
+        guard let url = candidates.first(where: { FileManager.default.isReadableFile(atPath: $0.path) }),
               let data = try? Data(contentsOf: url),
               let image = NSImage(data: data)
-        else {
-            return nil
-        }
+        else { return nil }
 
         image.isTemplate = true
         return image
