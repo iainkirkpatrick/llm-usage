@@ -320,10 +320,6 @@ final class AppController: NSObject, NSApplicationDelegate {
         weekly.isEnabled = false
         menu.addItem(weekly)
 
-        let credits = NSMenuItem(title: "Credits: \(Formatting.currency(codex.creditsRemaining))", action: nil, keyEquivalent: "")
-        credits.isEnabled = false
-        menu.addItem(credits)
-
         if let resetCredits = codex.resetCredits {
             let title = resetCredits.availableCount == 1
                 ? "Saved resets: 1 available"
@@ -357,15 +353,6 @@ final class AppController: NSObject, NSApplicationDelegate {
             menu.addItem(resetItem)
         }
 
-        if let email = account.email ?? codex.email {
-            let identity = NSMenuItem(title: "Identity: \(email)", action: nil, keyEquivalent: "")
-            identity.isEnabled = false
-            menu.addItem(identity)
-        }
-        let source = NSMenuItem(title: "Source: \(codex.sourceLabel)", action: nil, keyEquivalent: "")
-        source.isEnabled = false
-        menu.addItem(source)
-
         self.addPiHandoffControls(to: menu, accountID: account.id)
     }
 
@@ -385,8 +372,12 @@ final class AppController: NSObject, NSApplicationDelegate {
             release.isEnabled = !self.state.isCodexAccountOperationInProgress
             menu.addItem(release)
         } else {
+            let isAlreadyActive = self.state.activePiCodexAccountID == id
+            if isAlreadyActive {
+                menu.addItem(self.disabledItem("✓ Active in Pi"))
+            }
             let useInPi = NSMenuItem(
-                title: "Use this account in Pi…",
+                title: isAlreadyActive ? "Manage this active Pi account…" : "Use this account in Pi…",
                 action: #selector(self.useManagedCodexAccountInPi(_:)),
                 keyEquivalent: "")
             useInPi.target = self
@@ -904,12 +895,17 @@ final class AppController: NSObject, NSApplicationDelegate {
               let profile = self.state.managedCodexAccounts.first(where: { $0.id == id })
         else { return }
 
+        let isAlreadyActive = self.state.activePiCodexAccountID == id && self.state.piHandoffAccountID == nil
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "Use \(profile.label) in Pi?"
-        alert.informativeText = "This moves the selected account's live OAuth credential into ~/.pi/agent/auth.json under openai-codex. Its isolated managed CODEX_HOME will no longer contain a second active copy; other managed accounts stay isolated.\n\nExit running Pi sessions before switching. Resume or restart them after the switch so they reload the new account. If Pi refreshes the token later, switching away will save the latest tokens back to this account before another account is activated."
+        alert.messageText = isAlreadyActive
+            ? "Manage the active \(profile.label) Pi account?"
+            : "Use \(profile.label) in Pi?"
+        alert.informativeText = isAlreadyActive
+            ? "Pi is already authenticated as this account. LLM Usage Bar will keep Pi's current credential and remove the duplicate credential from its isolated managed CODEX_HOME, so only Pi owns the live refresh token. Switching away later will save Pi's latest tokens back to this profile."
+            : "This moves the selected account's live OAuth credential into ~/.pi/agent/auth.json under openai-codex. Its isolated managed CODEX_HOME will no longer contain a second active copy; other managed accounts stay isolated.\n\nExit running Pi sessions before switching. Resume or restart them after the switch so they reload the new account. If Pi refreshes the token later, switching away will save the latest tokens back to this account before another account is activated."
         alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Use in Pi")
+        alert.addButton(withTitle: isAlreadyActive ? "Manage account" : "Use in Pi")
         NSRunningApplication.current.activate()
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertSecondButtonReturn else { return }

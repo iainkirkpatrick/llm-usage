@@ -112,6 +112,7 @@ final class AppState {
     private(set) var authenticatingCodexAccountID: UUID?
     private(set) var isHandingOffCodexAccount = false
     private(set) var handoffRecoveryError: String?
+    private(set) var detectedPiCodexAccountID: UUID?
     private var isRedeemingCodexReset = false
     private var pendingCodexResetRedemption: PendingCodexResetRedemption?
     private var codexResetRefreshRequired = Set<String>()
@@ -139,6 +140,8 @@ final class AppState {
         } catch {
             self.recordHandoffFailureIfJournalRemains(error)
         }
+        self.detectedPiCodexAccountID = try? self.piCodexHandoff.managedProfileActiveInPi(
+            self.config.codexManagedAccounts)
     }
 
     var currentConfig: AppConfig {
@@ -162,17 +165,25 @@ final class AppState {
         self.config.codexPiHandoffAccountID
     }
 
+    var activePiCodexAccountID: UUID? {
+        self.config.codexPiHandoffAccountID ?? self.detectedPiCodexAccountID
+    }
+
     var piHandoffStatus: String {
         if let error = self.handoffRecoveryError {
             return "Pi handoff needs recovery: \(error)"
         }
-        guard let id = self.config.codexPiHandoffAccountID else {
-            return "No managed Codex account is active in Pi"
+        if let id = self.config.codexPiHandoffAccountID,
+           let profile = self.config.codexManagedAccounts.first(where: { $0.id == id })
+        {
+            return "Active in Pi: \(profile.label)"
         }
-        guard let profile = self.config.codexManagedAccounts.first(where: { $0.id == id }) else {
-            return "Pi handoff needs recovery"
+        if let id = self.detectedPiCodexAccountID,
+           let profile = self.config.codexManagedAccounts.first(where: { $0.id == id })
+        {
+            return "Active in Pi: \(profile.label) (not managed yet)"
         }
-        return "Active in Pi: \(profile.label)"
+        return "No managed Codex account is active in Pi"
     }
 
     @discardableResult
@@ -439,6 +450,7 @@ final class AppState {
             throw error
         }
         self.config = result.config
+        self.detectedPiCodexAccountID = id
         if let warning = result.warning,
            let journalInfo = try? AppOwnedPathSafety.info(at: self.piCodexHandoff.journalURL),
            journalInfo.exists
@@ -488,6 +500,7 @@ final class AppState {
             throw error
         }
         self.config = result.config
+        self.detectedPiCodexAccountID = nil
         if let warning = result.warning,
            let journalInfo = try? AppOwnedPathSafety.info(at: self.piCodexHandoff.journalURL),
            journalInfo.exists
@@ -645,6 +658,12 @@ final class AppState {
         defer { self.isRefreshing = false }
 
         AppLog.info("Refresh started: codex=\(self.config.codexEnabled) openCode=\(self.config.openCodeEnabled) pi=\(self.config.piEnabled) managedCodex=\(self.config.codexManagedAccounts.count)")
+
+        let handoff = self.piCodexHandoff
+        let profiles = self.config.codexManagedAccounts
+        self.detectedPiCodexAccountID = await Task.detached(priority: .utility) {
+            try? handoff.managedProfileActiveInPi(profiles)
+        }.value
 
         var codexResult: CodexSnapshot?
         var codexAccounts: [CodexAccountSnapshot] = []

@@ -726,6 +726,13 @@ struct PiAuthStore: Sendable {
         try self.withLockedDocument { document, _ in document.data }
     }
 
+    func currentOAuthAccountID() throws -> String? {
+        try self.withLockedDocument { document, _ in
+            guard let credentialObject = document.credentialObject else { return nil }
+            return try PiCodexCredentialCodec.piCredential(from: credentialObject).accountID
+        }
+    }
+
     fileprivate func replaceDocument(
         _ object: [String: Any],
         expectedData: Data,
@@ -861,6 +868,11 @@ struct PiCodexCredentialHandoff: Sendable {
             throw PiCodexCredentialHandoffError.handoffStateInvalid("the active profile has no ChatGPT account identity")
         }
         try self.piAuthStore.validateActiveCredential(expectedAccountID: accountID)
+    }
+
+    func managedProfileActiveInPi(_ profiles: [CodexManagedAccountProfile]) throws -> UUID? {
+        guard let accountID = try self.piAuthStore.currentOAuthAccountID() else { return nil }
+        return profiles.first(where: { Self.normalizedAccountID($0.accountID) == accountID })?.id
     }
 
     func recoverIfNeeded(config: AppConfig) throws {
