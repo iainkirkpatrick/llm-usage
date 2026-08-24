@@ -263,14 +263,29 @@ struct CodexNodeBridge: Sendable {
         }
     }
 
+    func fetchPiAuth() async throws -> CodexSnapshot {
+        // The active managed account is deliberately handed to Pi. Do not add --codex-home here:
+        // the bundled Node core must exercise Pi's locked OAuth storage and refresh path.
+        try await self.fetch(arguments: ["codex", "--json"])
+    }
+
     func fetchManaged(codexHome: URL) async throws -> CodexSnapshot {
         try await self.fetch(arguments: ["codex", "--codex-home", codexHome.path, "--json"])
     }
 
-    func consumeResetCredit(creditID: String, idempotencyKey: String, codexHome: URL) async throws -> String {
+    func consumeResetCredit(
+        creditID: String,
+        idempotencyKey: String,
+        expectedChatGPTAccountID: String,
+        codexHome: URL? = nil) async throws -> String
+    {
         var arguments = ["codex", "reset", "consume", "--credit-id", creditID,
-                         "--idempotency-key", idempotencyKey]
-        arguments += ["--codex-home", codexHome.path, "--json"]
+                         "--idempotency-key", idempotencyKey,
+                         "--expected-account-id", expectedChatGPTAccountID]
+        if let codexHome {
+            arguments += ["--codex-home", codexHome.path]
+        }
+        arguments.append("--json")
         return try await self.runJSON(arguments: arguments) { (output: NodeConsumeOutput) in output.outcome }
     }
 

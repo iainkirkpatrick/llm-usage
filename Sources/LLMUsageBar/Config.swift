@@ -6,6 +6,10 @@ struct CodexManagedAccountProfile: Codable, Sendable, Equatable {
     var label: String
     var email: String?
     var planType: String?
+    // ChatGPT account identity is deliberately metadata only. OAuth tokens remain in the
+    // isolated native home when this account is inactive, or in Pi auth.json while it is handed
+    // off to Pi.
+    var accountID: String?
     let createdAt: Date
     var lastAuthenticatedAt: Date?
 
@@ -14,6 +18,7 @@ struct CodexManagedAccountProfile: Codable, Sendable, Equatable {
         label: String,
         email: String? = nil,
         planType: String? = nil,
+        accountID: String? = nil,
         createdAt: Date = Date(),
         lastAuthenticatedAt: Date? = nil)
     {
@@ -21,6 +26,7 @@ struct CodexManagedAccountProfile: Codable, Sendable, Equatable {
         self.label = label
         self.email = email
         self.planType = planType
+        self.accountID = accountID
         self.createdAt = createdAt
         self.lastAuthenticatedAt = lastAuthenticatedAt
     }
@@ -30,6 +36,7 @@ struct CodexManagedAccountProfile: Codable, Sendable, Equatable {
         case label
         case email
         case planType
+        case accountID
         case createdAt
         case lastAuthenticatedAt
     }
@@ -40,12 +47,13 @@ struct CodexManagedAccountProfile: Codable, Sendable, Equatable {
         self.label = try container.decode(String.self, forKey: .label)
         self.email = try container.decodeIfPresent(String.self, forKey: .email)
         self.planType = try container.decodeIfPresent(String.self, forKey: .planType)
+        self.accountID = try container.decodeIfPresent(String.self, forKey: .accountID)
         self.createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
         self.lastAuthenticatedAt = try container.decodeIfPresent(Date.self, forKey: .lastAuthenticatedAt)
     }
 }
 
-struct AppConfig: Codable {
+struct AppConfig: Codable, Equatable, Sendable {
     var refreshIntervalSeconds: Int
     var codexEnabled: Bool
     var openCodeEnabled: Bool
@@ -57,6 +65,10 @@ struct AppConfig: Codable {
     var autoRedeemExpiringCodexResets: Bool
     var codexManagedAccounts: [CodexManagedAccountProfile]
     var codexPrimaryAccountID: UUID?
+    // When non-nil, this profile's live OAuth credential is in Pi auth.json rather than its
+    // managed CODEX_HOME. The native home is intentionally kept without auth.json so two
+    // independently-refreshing copies cannot exist.
+    var codexPiHandoffAccountID: UUID?
 
     static let `default` = AppConfig(
         refreshIntervalSeconds: 300,
@@ -69,7 +81,8 @@ struct AppConfig: Codable {
         piDeduplicateForkHistory: true,
         autoRedeemExpiringCodexResets: false,
         codexManagedAccounts: [],
-        codexPrimaryAccountID: nil
+        codexPrimaryAccountID: nil,
+        codexPiHandoffAccountID: nil
     )
 
     init(
@@ -83,7 +96,8 @@ struct AppConfig: Codable {
         piDeduplicateForkHistory: Bool,
         autoRedeemExpiringCodexResets: Bool,
         codexManagedAccounts: [CodexManagedAccountProfile] = [],
-        codexPrimaryAccountID: UUID? = nil
+        codexPrimaryAccountID: UUID? = nil,
+        codexPiHandoffAccountID: UUID? = nil
     ) {
         self.refreshIntervalSeconds = refreshIntervalSeconds
         self.codexEnabled = codexEnabled
@@ -96,6 +110,7 @@ struct AppConfig: Codable {
         self.autoRedeemExpiringCodexResets = autoRedeemExpiringCodexResets
         self.codexManagedAccounts = codexManagedAccounts
         self.codexPrimaryAccountID = codexPrimaryAccountID
+        self.codexPiHandoffAccountID = codexPiHandoffAccountID
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -110,6 +125,7 @@ struct AppConfig: Codable {
         case autoRedeemExpiringCodexResets
         case codexManagedAccounts
         case codexPrimaryAccountID
+        case codexPiHandoffAccountID
     }
 
     init(from decoder: Decoder) throws {
@@ -127,7 +143,13 @@ struct AppConfig: Codable {
         self.autoRedeemExpiringCodexResets = try container.decodeIfPresent(Bool.self, forKey: .autoRedeemExpiringCodexResets) ?? defaults.autoRedeemExpiringCodexResets
         self.codexManagedAccounts = try container.decodeIfPresent([CodexManagedAccountProfile].self, forKey: .codexManagedAccounts) ?? defaults.codexManagedAccounts
         self.codexPrimaryAccountID = try container.decodeIfPresent(UUID.self, forKey: .codexPrimaryAccountID)
+        self.codexPiHandoffAccountID = try container.decodeIfPresent(UUID.self, forKey: .codexPiHandoffAccountID)
     }
+}
+
+struct ConfigDiskSnapshot: Equatable, Sendable {
+    let exists: Bool
+    let data: Data?
 }
 
 struct AppOwnedPathInfo: Sendable {
@@ -136,6 +158,8 @@ struct AppOwnedPathInfo: Sendable {
     let isDirectory: Bool
     let isRegularFile: Bool
     let permissions: Int
+    let device: UInt64
+    let inode: UInt64
 }
 
 enum AppOwnedPathError: LocalizedError, Equatable, Sendable {
@@ -177,7 +201,9 @@ enum AppOwnedPathSafety {
                     isSymbolicLink: false,
                     isDirectory: false,
                     isRegularFile: false,
-                    permissions: 0)
+                    permissions: 0,
+                    device: 0,
+                    inode: 0)
             }
             throw AppOwnedPathError.filesystem(
                 url.path,
@@ -190,7 +216,9 @@ enum AppOwnedPathSafety {
             isSymbolicLink: type == S_IFLNK,
             isDirectory: type == S_IFDIR,
             isRegularFile: type == S_IFREG,
-            permissions: Int(fileStat.st_mode & 0o777))
+            permissions: Int(fileStat.st_mode & 0o777),
+            device: UInt64(fileStat.st_dev),
+            inode: UInt64(fileStat.st_ino))
     }
 
     static func ensureDirectory(at url: URL, permissions: Int = 0o700) throws {
@@ -289,6 +317,58 @@ enum AppOwnedPathSafety {
     }
 }
 
+private enum ConfigStoreError: Error {
+    case concurrentChange
+}
+
+// The lock is an advisory, kernel-owned lock on a protected regular file. The pathname is never
+// deleted as stale: flock releases ownership when a process exits, so a crashed writer cannot
+// leave a directory that a later writer has to guess about. Every ConfigStore save holds this lock
+// from its current-document comparison through the atomic replacement.
+private final class ConfigStoreSaveLock {
+    private let descriptor: Int32
+
+    init(at url: URL) throws {
+        let descriptor = url.withUnsafeFileSystemRepresentation { pointer -> Int32 in
+            guard let pointer else { return -1 }
+            return Darwin.open(pointer, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
+        }
+        guard descriptor >= 0 else {
+            throw AppOwnedPathError.filesystem(
+                url.path,
+                String(cString: strerror(errno)))
+        }
+        self.descriptor = descriptor
+
+        do {
+            var fileStat = Darwin.stat()
+            guard Darwin.fstat(descriptor, &fileStat) == 0,
+                  fileStat.st_mode & S_IFMT == S_IFREG
+            else {
+                throw AppOwnedPathError.notRegularFile(url.path)
+            }
+            guard Darwin.fchmod(descriptor, mode_t(0o600)) == 0 else {
+                throw AppOwnedPathError.permissionHardeningFailed(url.path)
+            }
+            while flock(descriptor, LOCK_EX) != 0 {
+                guard errno == EINTR else {
+                    throw AppOwnedPathError.filesystem(
+                        url.path,
+                        String(cString: strerror(errno)))
+                }
+            }
+        } catch {
+            _ = Darwin.close(descriptor)
+            throw error
+        }
+    }
+
+    deinit {
+        _ = flock(self.descriptor, LOCK_UN)
+        _ = Darwin.close(self.descriptor)
+    }
+}
+
 enum ConfigStore {
     static let appDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".llm-usage-bar", isDirectory: true)
@@ -327,10 +407,97 @@ enum ConfigStore {
 
     @discardableResult
     static func save(_ config: AppConfig) -> Bool {
+        self.save(
+            config,
+            onlyIfCurrent: nil,
+            directoryURL: self.appDirectoryURL,
+            fileURL: self.fileURL)
+    }
+
+    // Credential handoff is a multi-file transaction. Refuse to overwrite a config document that
+    // changed after AppState loaded it; ordinary UI saves retain their historical last-writer-wins
+    // behavior for compatibility.
+    @discardableResult
+    static func saveIfUnchanged(_ config: AppConfig, expected: ConfigDiskSnapshot) -> Bool {
+        self.save(
+            config,
+            onlyIfCurrent: expected,
+            directoryURL: self.appDirectoryURL,
+            fileURL: self.fileURL)
+    }
+
+    // Test-only storage keeps concurrency tests away from a user's real configuration while using
+    // exactly the same lock and compare/replace implementation as the app-owned path.
+    static func saveForTesting(
+        _ config: AppConfig,
+        at directoryURL: URL,
+        expected: ConfigDiskSnapshot? = nil) -> Bool
+    {
+        let fileURL = directoryURL.appendingPathComponent("config.json")
+        return self.save(
+            config,
+            onlyIfCurrent: expected,
+            directoryURL: directoryURL,
+            fileURL: fileURL)
+    }
+
+    static func diskSnapshot() -> ConfigDiskSnapshot {
+        self.diskSnapshot(at: self.fileURL)
+    }
+
+    static func diskSnapshotForTesting(at directoryURL: URL) -> ConfigDiskSnapshot {
+        self.diskSnapshot(at: directoryURL.appendingPathComponent("config.json"))
+    }
+
+    private static func diskSnapshot(at fileURL: URL) -> ConfigDiskSnapshot {
+        guard let info = try? AppOwnedPathSafety.info(at: fileURL), info.exists else {
+            return ConfigDiskSnapshot(exists: false, data: nil)
+        }
+        guard let data = try? Data(contentsOf: fileURL) else {
+            return ConfigDiskSnapshot(exists: true, data: nil)
+        }
+        return ConfigDiskSnapshot(exists: true, data: data)
+    }
+
+    // Return a CAS token only when the persisted document (including its effective environment
+    // overrides) is the exact configuration the caller currently owns. Capturing an arbitrary
+    // disk snapshot is not sufficient: AppState may already be stale before it asks for the CAS.
+    static func diskSnapshot(matching config: AppConfig) -> ConfigDiskSnapshot? {
+        let snapshot = self.diskSnapshot()
+        let persisted: AppConfig
+        if let data = snapshot.data {
+            guard let decoded = try? JSONDecoder().decode(AppConfig.self, from: data) else { return nil }
+            persisted = decoded
+        } else if !snapshot.exists {
+            persisted = .default
+        } else {
+            return nil
+        }
+        guard self.applyEnvironmentOverrides(to: persisted) == config else { return nil }
+        return snapshot
+    }
+
+    private static func save(
+        _ config: AppConfig,
+        onlyIfCurrent expected: ConfigDiskSnapshot?,
+        directoryURL: URL,
+        fileURL: URL) -> Bool
+    {
         var temporaryURL: URL?
         do {
-            try self.ensureAppDirectory()
-            let persisted = self.loadPersistedConfigFromDisk() ?? .default
+            try self.ensureAppDirectory(at: directoryURL, fileURL: fileURL)
+            // Keep the lock alive for the complete compare/read/prepare/recheck/replace
+            // sequence. Handoff already holds its journal and Pi locks, so this is deliberately
+            // the final lock in that order; ConfigStore never acquires either of those locks.
+            let saveLock = try ConfigStoreSaveLock(
+                at: directoryURL.appendingPathComponent("config.json.lock"))
+            defer { _ = saveLock }
+            if let expected {
+                guard !(expected.exists && expected.data == nil),
+                      self.diskSnapshot(at: fileURL) == expected
+                else { return false }
+            }
+            let persisted = self.loadPersistedConfigFromDisk(at: fileURL) ?? .default
             var valueToWrite = config
 
             // The in-memory AppConfig is the effective configuration and therefore contains env
@@ -355,29 +522,36 @@ enum ConfigStore {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(valueToWrite)
-            let temporary = self.appDirectoryURL
+            let temporary = directoryURL
                 .appendingPathComponent(".config-\(UUID().uuidString).tmp")
             temporaryURL = temporary
             try data.write(to: temporary, options: [.atomic])
             try AppOwnedPathSafety.hardenRegularFile(at: temporary, permissions: 0o600)
 
-            let existing = try AppOwnedPathSafety.info(at: self.fileURL)
+            // Re-check immediately before replacement. This is not a kernel CAS, but catches the
+            // practical case of another editor or app instance changing config during preparation.
+            if let expected {
+                guard self.diskSnapshot(at: fileURL) == expected else {
+                    throw ConfigStoreError.concurrentChange
+                }
+            }
+            let existing = try AppOwnedPathSafety.info(at: fileURL)
             if existing.exists {
-                try AppOwnedPathSafety.validateRegularFile(at: self.fileURL, allowMissing: false)
+                try AppOwnedPathSafety.validateRegularFile(at: fileURL, allowMissing: false)
                 _ = try FileManager.default.replaceItemAt(
-                    self.fileURL,
+                    fileURL,
                     withItemAt: temporary,
                     backupItemName: nil,
                     options: [])
             } else {
-                try FileManager.default.moveItem(at: temporary, to: self.fileURL)
+                try FileManager.default.moveItem(at: temporary, to: fileURL)
             }
             temporaryURL = nil
-            let installed = try AppOwnedPathSafety.info(at: self.fileURL)
+            let installed = try AppOwnedPathSafety.info(at: fileURL)
             guard installed.exists, !installed.isSymbolicLink, installed.isRegularFile,
                   installed.permissions == 0o600
             else {
-                throw AppOwnedPathError.permissionHardeningFailed(self.fileURL.path)
+                throw AppOwnedPathError.permissionHardeningFailed(fileURL.path)
             }
             return true
         } catch {
@@ -419,6 +593,15 @@ enum ConfigStore {
         try self.validateAppOwnedPaths()
     }
 
+    private static func ensureAppDirectory(at directoryURL: URL, fileURL: URL) throws {
+        if directoryURL.standardizedFileURL.path == self.appDirectoryURL.standardizedFileURL.path {
+            try self.ensureAppDirectory()
+            return
+        }
+        try AppOwnedPathSafety.ensureDirectoryTree(at: directoryURL, permissions: 0o700)
+        try AppOwnedPathSafety.validateRegularFile(at: fileURL)
+    }
+
     static func validateAppOwnedFile(_ url: URL) throws {
         try self.ensureAppDirectory()
         try AppOwnedPathSafety.validateRegularFile(at: url)
@@ -446,10 +629,14 @@ enum ConfigStore {
     }
 
     private static func loadPersistedConfigFromDisk() -> AppConfig? {
-        guard let info = try? AppOwnedPathSafety.info(at: self.fileURL), info.exists else {
+        self.loadPersistedConfigFromDisk(at: self.fileURL)
+    }
+
+    private static func loadPersistedConfigFromDisk(at fileURL: URL) -> AppConfig? {
+        guard let info = try? AppOwnedPathSafety.info(at: fileURL), info.exists else {
             return nil
         }
-        guard let data = try? Data(contentsOf: self.fileURL) else {
+        guard let data = try? Data(contentsOf: fileURL) else {
             return nil
         }
         return try? JSONDecoder().decode(AppConfig.self, from: data)

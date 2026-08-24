@@ -17,6 +17,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var refreshTask: Task<Void, Never>?
     private var managedLoginTask: Task<Void, Never>?
+    private var piHandoffTask: Task<Void, Never>?
     private var state: AppState!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -48,6 +49,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         self.refreshTask?.cancel()
         self.managedLoginTask?.cancel()
+        self.piHandoffTask?.cancel()
     }
 
     private func hasExistingInstance() -> Bool {
@@ -255,6 +257,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         let header = NSMenuItem(title: "Codex accounts", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
+        menu.addItem(self.disabledItem("Pi handoff: \(self.state.piHandoffStatus)"))
 
         var accounts = snapshot.codexAccounts
         if accounts.isEmpty {
@@ -299,6 +302,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             } else {
                 menu.addItem(self.disabledItem("No data yet"))
             }
+            self.addPiHandoffControls(to: menu, accountID: account.id)
             return
         }
 
@@ -361,6 +365,35 @@ final class AppController: NSObject, NSApplicationDelegate {
         let source = NSMenuItem(title: "Source: \(codex.sourceLabel)", action: nil, keyEquivalent: "")
         source.isEnabled = false
         menu.addItem(source)
+
+        self.addPiHandoffControls(to: menu, accountID: account.id)
+    }
+
+    private func addPiHandoffControls(to menu: NSMenu, accountID: String) {
+        guard let id = UUID(uuidString: accountID),
+              self.state.managedCodexAccounts.contains(where: { $0.id == id })
+        else { return }
+
+        if self.state.piHandoffAccountID == id {
+            menu.addItem(self.disabledItem("✓ Active in Pi"))
+            let release = NSMenuItem(
+                title: "Stop using this account in Pi…",
+                action: #selector(self.releaseManagedCodexAccountFromPi(_:)),
+                keyEquivalent: "")
+            release.target = self
+            release.representedObject = id
+            release.isEnabled = !self.state.isCodexAccountOperationInProgress
+            menu.addItem(release)
+        } else {
+            let useInPi = NSMenuItem(
+                title: "Use this account in Pi…",
+                action: #selector(self.useManagedCodexAccountInPi(_:)),
+                keyEquivalent: "")
+            useInPi.target = self
+            useInPi.representedObject = id
+            useInPi.isEnabled = !self.state.isCodexAccountOperationInProgress
+            menu.addItem(useInPi)
+        }
     }
 
     private func addOpenCodeSection(to menu: NSMenu, snapshot: AppSnapshot) {
@@ -540,16 +573,31 @@ final class AppController: NSObject, NSApplicationDelegate {
             select.isEnabled = !self.state.isCodexAccountOperationInProgress
             accountMenu.addItem(select)
 
+            let piIsActive = self.state.piHandoffAccountID == profile.id
+            if piIsActive {
+                let release = NSMenuItem(title: "Stop using this account in Pi…", action: #selector(self.releaseManagedCodexAccountFromPi(_:)), keyEquivalent: "")
+                release.target = self
+                release.representedObject = profile.id
+                release.isEnabled = !self.state.isCodexAccountOperationInProgress
+                accountMenu.addItem(release)
+            } else {
+                let useInPi = NSMenuItem(title: "Use this account in Pi…", action: #selector(self.useManagedCodexAccountInPi(_:)), keyEquivalent: "")
+                useInPi.target = self
+                useInPi.representedObject = profile.id
+                useInPi.isEnabled = !self.state.isCodexAccountOperationInProgress
+                accountMenu.addItem(useInPi)
+            }
+
             let reauthenticate = NSMenuItem(title: "Sign in again…", action: #selector(self.reauthenticateManagedCodexAccount(_:)), keyEquivalent: "")
             reauthenticate.target = self
             reauthenticate.representedObject = profile.id
-            reauthenticate.isEnabled = !self.state.isCodexAccountOperationInProgress
+            reauthenticate.isEnabled = !self.state.isCodexAccountOperationInProgress && !piIsActive
             accountMenu.addItem(reauthenticate)
 
             let remove = NSMenuItem(title: "Remove account…", action: #selector(self.removeManagedCodexAccount(_:)), keyEquivalent: "")
             remove.target = self
             remove.representedObject = profile.id
-            remove.isEnabled = !self.state.isCodexAccountOperationInProgress
+            remove.isEnabled = !self.state.isCodexAccountOperationInProgress && !piIsActive
             accountMenu.addItem(remove)
 
             accountItem.submenu = accountMenu
@@ -848,6 +896,75 @@ final class AppController: NSObject, NSApplicationDelegate {
         // immediately so the glyph and reset controls cannot continue showing another account.
         Task { [weak self] in
             await self?.refreshAndUpdateMenu()
+        }
+    }
+
+    @objc private func useManagedCodexAccountInPi(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let profile = self.state.managedCodexAccounts.first(where: { $0.id == id })
+        else { return }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Use \(profile.label) in Pi?"
+        alert.informativeText = "This moves the selected account's live OAuth credential into ~/.pi/agent/auth.json under openai-codex. Its isolated managed CODEX_HOME will no longer contain a second active copy; other managed accounts stay isolated.\n\nExit running Pi sessions before switching. Resume or restart them after the switch so they reload the new account. If Pi refreshes the token later, switching away will save the latest tokens back to this account before another account is activated."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Use in Pi")
+        NSRunningApplication.current.activate()
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        self.startPiCodexHandoff(accountID: id, activate: true)
+    }
+
+    @objc private func releaseManagedCodexAccountFromPi(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let profile = self.state.managedCodexAccounts.first(where: { $0.id == id })
+        else { return }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Stop using \(profile.label) in Pi?"
+        alert.informativeText = "LLM Usage Bar will save Pi's latest OAuth tokens into this account's isolated CODEX_HOME and remove openai-codex from ~/.pi/agent/auth.json. Exit running Pi sessions first; resume them only after they have reloaded their credentials."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Stop using in Pi")
+        NSRunningApplication.current.activate()
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        self.startPiCodexHandoff(accountID: id, activate: false)
+    }
+
+    private func startPiCodexHandoff(accountID: UUID, activate: Bool) {
+        guard self.piHandoffTask == nil else {
+            self.showAlert(title: "Pi account switch already in progress", message: "Wait for the current credential handoff to finish.", style: .warning)
+            return
+        }
+        self.rebuildMenu()
+        self.piHandoffTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.piHandoffTask = nil
+                self.rebuildMenu()
+            }
+            do {
+                let warning: String?
+                if activate {
+                    warning = try await self.state.useManagedCodexAccountInPi(id: accountID)
+                } else {
+                    warning = try await self.state.releaseManagedCodexAccountFromPi(id: accountID)
+                }
+                self.rebuildMenu()
+                let message = warning.map { "\n\n\($0)" } ?? ""
+                self.showAlert(
+                    title: activate ? "Codex account is active in Pi" : "Pi Codex handoff released",
+                    message: "Exit and resume running Pi sessions so they reload credentials. Usage will refresh now.\(message)")
+                await self.refreshAndUpdateMenu()
+            } catch {
+                self.rebuildMenu()
+                self.showAlert(
+                    title: activate ? "Could not use account in Pi" : "Could not release Pi handoff",
+                    message: error.localizedDescription,
+                    style: .warning)
+            }
         }
     }
 

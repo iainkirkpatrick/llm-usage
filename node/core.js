@@ -23,15 +23,25 @@ function jwtAccountId(token) {
   } catch { return null; }
 }
 
-export async function piTokens(authPath) {
+export async function piTokens(authPath, expectedChatgptAccountId = null) {
   const storage = AuthStorage.create(authPath || undefined);
   const credential = storage.get(PROVIDER);
   if (!credential || credential.type !== "oauth") return null;
   const accessToken = await storage.getApiKey(PROVIDER);
   storage.reload();
   const refreshed = storage.get(PROVIDER);
-  const accountId = refreshed?.type === "oauth" && refreshed.accountId || jwtAccountId(accessToken);
+  const tokenAccountId = jwtAccountId(accessToken);
+  const declaredAccountId = refreshed?.type === "oauth" && nonEmptyString(refreshed.accountId)
+    ? refreshed.accountId.trim()
+    : null;
+  if (declaredAccountId && tokenAccountId && declaredAccountId !== tokenAccountId) {
+    throw new Error("Pi Codex OAuth account identity does not match its access token.");
+  }
+  const accountId = declaredAccountId || tokenAccountId;
   if (!accessToken || !accountId) throw new Error("Pi Codex OAuth credential is incomplete.");
+  if (expectedChatgptAccountId && accountId !== expectedChatgptAccountId) {
+    throw new Error(`Pi Codex OAuth credential belongs to a different ChatGPT account (expected ${expectedChatgptAccountId}, found ${accountId}).`);
+  }
   return { accessToken, chatgptAccountId: accountId, chatgptPlanType: null };
 }
 
@@ -55,6 +65,17 @@ export function classifyWindows(primary, secondary) {
     if (!weekly) weekly = unknown.find(w => w !== session);
   }
   return { session: session ?? null, weekly: weekly ?? null };
+}
+
+function nativeAccountID(accountResponse) {
+  const values = [accountResponse, accountResponse?.account];
+  for (const value of values) {
+    if (!value || typeof value !== "object") continue;
+    for (const key of ["accountId", "account_id", "chatgptAccountId", "chatgpt_account_id", "id"]) {
+      if (nonEmptyString(value[key])) return value[key].trim();
+    }
+  }
+  return null;
 }
 
 function nativeAccountMetadata(accountResponse) {
@@ -149,9 +170,19 @@ function validateNativeAuthFile(authPath) {
       !nonEmptyString(auth.tokens.access_token) || !nonEmptyString(auth.tokens.refresh_token)) {
     throw new Error("Managed Codex auth.json does not contain a supported ChatGPT OAuth credential.");
   }
-  if (auth.tokens.account_id !== undefined && !nonEmptyString(auth.tokens.account_id)) {
+  const declaredAccountId = auth.tokens.account_id === undefined ? null : nonEmptyString(auth.tokens.account_id)
+    ? auth.tokens.account_id.trim()
+    : null;
+  if (auth.tokens.account_id !== undefined && !declaredAccountId) {
     throw new Error("Managed Codex auth.json contains an invalid account id.");
   }
+  const tokenAccountId = jwtAccountId(auth.tokens.access_token);
+  if (declaredAccountId && tokenAccountId && declaredAccountId !== tokenAccountId) {
+    throw new Error("Managed Codex auth.json account_id does not match its access token.");
+  }
+  const accountId = declaredAccountId || tokenAccountId;
+  if (!accountId) throw new Error("Managed Codex auth.json is missing the ChatGPT account identity.");
+  return accountId;
 }
 
 function secureManagedHome(codexHome) {
@@ -299,7 +330,7 @@ async function initialize(rpc) {
   rpc.child.stdin.write(JSON.stringify({ method: "initialized", params: {} }) + "\n");
 }
 
-async function nativeAccount(rpc, timeoutMs) {
+async function nativeAccount(rpc, timeoutMs, expectedChatgptAccountId = null) {
   let account;
   try {
     account = await withTimeout(rpc.request("account/read", { refreshToken: true }), timeoutMs);
@@ -310,6 +341,18 @@ async function nativeAccount(rpc, timeoutMs) {
     account = await withTimeout(rpc.request("account/read"), timeoutMs);
   }
   if (!account?.account) throw new Error("Managed Codex account is not authenticated.");
+  if (expectedChatgptAccountId) {
+    // Reset consumption is fail-closed when this app-server version does not echo an identity.
+    // A credential-file precheck alone is not enough to prove which account the running server
+    // authenticated after an external refresh or replacement.
+    const serverAccountId = nativeAccountID(account);
+    if (!serverAccountId) {
+      throw new Error("Codex app-server did not return a ChatGPT account identity; reset consumption is disabled for this server version.");
+    }
+    if (serverAccountId !== expectedChatgptAccountId) {
+      throw new Error(`Codex app-server authenticated a different ChatGPT account (expected ${expectedChatgptAccountId}, found ${serverAccountId}).`);
+    }
+  }
   return account;
 }
 
@@ -327,14 +370,19 @@ async function fetchNativeUsage({ pathToCodex, codexHome, timeoutMs }) {
   }
 }
 
-export async function fetchUsage({ authPath = process.env.LLM_BAR_PI_AUTH_PATH, codexHome = null, timeoutMs = TIMEOUT_MS } = {}) {
+export async function fetchUsage({
+  authPath = process.env.LLM_BAR_PI_AUTH_PATH,
+  codexHome = null,
+  expectedChatgptAccountId = null,
+  timeoutMs = TIMEOUT_MS
+} = {}) {
   const pathToCodex = resolveCodex();
   if (!pathToCodex) throw new Error(`Codex executable not found. Checked: ${candidates().join(", ")}`);
   if (codexHome != null) return fetchNativeUsage({ pathToCodex, codexHome, timeoutMs });
 
-  const initial = await piTokens(authPath);
+  const initial = await piTokens(authPath, expectedChatgptAccountId);
   if (!initial) throw new Error("Pi-managed openai-codex OAuth is not available.");
-  const rpc = new RPC(pathToCodex, { tokens: async () => piTokens(authPath) });
+  const rpc = new RPC(pathToCodex, { tokens: async () => piTokens(authPath, expectedChatgptAccountId) });
   try {
     return makeUsage(await withTimeout((async () => {
       await initialize(rpc);
@@ -346,6 +394,7 @@ export async function fetchUsage({ authPath = process.env.LLM_BAR_PI_AUTH_PATH, 
 
 export async function fetchAllManagedUsage({
   configPath = process.env.LLM_BAR_CONFIG_PATH || path.join(os.homedir(), ".llm-usage-bar", "config.json"),
+  authPath = process.env.LLM_BAR_PI_AUTH_PATH,
   timeoutMs = TIMEOUT_MS
 } = {}) {
   let config;
@@ -371,6 +420,13 @@ export async function fetchAllManagedUsage({
     };
   }
 
+  const piHandoffID = typeof config?.codexPiHandoffAccountID === "string"
+    ? config.codexPiHandoffAccountID
+    : null;
+  if (piHandoffID && !profiles.some(profile => profile?.id === piHandoffID)) {
+    throw new Error("The managed-account configuration contains an invalid Pi handoff account.");
+  }
+
   const configRoot = path.dirname(path.resolve(configPath));
   const homesRoot = path.join(configRoot, "codex-accounts");
   const accounts = [];
@@ -378,12 +434,22 @@ export async function fetchAllManagedUsage({
     const id = typeof profile?.id === "string" ? profile.id : "";
     const label = typeof profile?.label === "string" && profile.label.trim() ? profile.label.trim() : "Managed Codex";
     const email = typeof profile?.email === "string" && profile.email.trim() ? profile.email.trim() : null;
+    const accountID = typeof profile?.accountID === "string" && profile.accountID.trim() ? profile.accountID.trim() : null;
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
       accounts.push({ id, label, email, usage: null, error: "Invalid managed account id." });
       continue;
     }
     try {
-      const usage = await fetchUsage({ codexHome: path.join(homesRoot, id), timeoutMs });
+      // An app handoff deliberately removes auth.json from the active managed home. Reuse Pi's
+      // locked auth path for that one profile; all inactive profiles stay native and isolated.
+      let usage;
+      if (id === piHandoffID) {
+        // Usage is read-only; use the supplied Pi path even for legacy profiles that predate
+        // accountID metadata. When metadata exists, validate it in the same Pi RPC setup.
+        usage = await fetchUsage({ authPath, expectedChatgptAccountId: accountID, timeoutMs });
+      } else {
+        usage = await fetchUsage({ codexHome: path.join(homesRoot, id), timeoutMs });
+      }
       accounts.push({ id, label, email: usage.codex.email ?? email, usage: usage.codex, error: null });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -401,16 +467,33 @@ export async function fetchAllManagedUsage({
   return { codex: selected?.usage ?? null, codexAccounts: accounts };
 }
 
-export async function consumeCredit({ creditId, idempotencyKey, codexHome = null, authPath = process.env.LLM_BAR_PI_AUTH_PATH, timeoutMs = TIMEOUT_MS }) {
+export async function consumeCredit({
+  creditId,
+  idempotencyKey,
+  codexHome = null,
+  authPath = process.env.LLM_BAR_PI_AUTH_PATH,
+  expectedChatgptAccountId = null,
+  timeoutMs = TIMEOUT_MS
+}) {
   if (!creditId || !idempotencyKey) throw new Error("--credit-id and --idempotency-key are required.");
+  if (!nonEmptyString(expectedChatgptAccountId)) {
+    throw new Error("--expected-account-id is required; refusing an account-unbound reset operation.");
+  }
+  const expectedAccountId = expectedChatgptAccountId.trim();
   const pathToCodex = resolveCodex(); if (!pathToCodex) throw new Error("Codex executable not found.");
 
   if (codexHome != null) {
     const home = secureManagedHome(codexHome);
+    const credentialAccountId = validateNativeAuthFile(path.join(home, "auth.json"));
+    if (credentialAccountId !== expectedAccountId) {
+      throw new Error(`Managed Codex credential belongs to a different ChatGPT account (expected ${expectedAccountId}, found ${credentialAccountId}).`);
+    }
     const rpc = new RPC(pathToCodex, { codexHome: home });
     try {
       await withTimeout(initialize(rpc), timeoutMs);
-      await nativeAccount(rpc, timeoutMs);
+      // This identity check and the irreversible consume request share one app-server process.
+      // The credential snapshot is checked before the server is allowed to consume anything.
+      await nativeAccount(rpc, timeoutMs, expectedAccountId);
       return await withTimeout(rpc.request("account/rateLimitResetCredit/consume", { creditId, idempotencyKey }), timeoutMs);
     } finally {
       rpc.close();
@@ -418,12 +501,15 @@ export async function consumeCredit({ creditId, idempotencyKey, codexHome = null
     }
   }
 
-  const initial = await piTokens(authPath); if (!initial) throw new Error("Pi-managed openai-codex OAuth is not available.");
-  const rpc = new RPC(pathToCodex, { tokens: async () => piTokens(authPath) });
+  const initial = await piTokens(authPath, expectedAccountId);
+  if (!initial) throw new Error("Pi-managed openai-codex OAuth is not available.");
+  const rpc = new RPC(pathToCodex, { tokens: async () => piTokens(authPath, expectedAccountId) });
   try {
     return await withTimeout((async () => {
       await initialize(rpc);
       await rpc.request("account/login/start", { type: "chatgptAuthTokens", ...initial, chatgptPlanType: null });
+      // Validate the account after login/refresh and immediately before the irreversible request.
+      await nativeAccount(rpc, timeoutMs, expectedAccountId);
       return rpc.request("account/rateLimitResetCredit/consume", { creditId, idempotencyKey });
     })(), timeoutMs);
   } finally { rpc.close(); }

@@ -143,6 +143,20 @@ struct ManagedCodexHomeStore: @unchecked Sendable {
         try AppOwnedPathSafety.hardenRegularFile(at: authURL, permissions: 0o600)
     }
 
+    func accountID(for accountID: UUID) throws -> String? {
+        let home = try self.prepareAccountHome(for: accountID)
+        let authURL = home.appendingPathComponent("auth.json")
+        try AppOwnedPathSafety.validateRegularFile(at: authURL, allowMissing: false)
+        let info = try AppOwnedPathSafety.info(at: authURL)
+        guard info.permissions == 0o600 else {
+            throw ManagedCodexHomeStoreError.insecureAuthFile(authURL.path)
+        }
+        let data: Data
+        do { data = try Data(contentsOf: authURL) }
+        catch { throw ManagedCodexHomeStoreError.invalidAuthFile(authURL.path) }
+        return try Self.accountID(from: data, path: authURL.path)
+    }
+
     func validateAuthCredentials(in home: URL) throws {
         try self.validateManagedPath(home, allowMissing: false)
         let info = try AppOwnedPathSafety.info(at: home)
@@ -202,7 +216,8 @@ struct ManagedCodexHomeStore: @unchecked Sendable {
         }
     }
 
-    func commitStagedAuth(for accountID: UUID, stagingHome: URL) throws {
+    @discardableResult
+    func commitStagedAuth(for accountID: UUID, stagingHome: URL) throws -> String {
         let home = try self.prepareAccountHome(for: accountID)
         try self.validateManagedPath(stagingHome, allowMissing: false)
         let stagingInfo = try AppOwnedPathSafety.info(at: stagingHome)
@@ -213,6 +228,10 @@ struct ManagedCodexHomeStore: @unchecked Sendable {
         let stagedAuth = stagingHome.appendingPathComponent("auth.json")
         try AppOwnedPathSafety.hardenRegularFile(at: stagedAuth, permissions: 0o600)
         try self.validateAuthCredentials(in: stagingHome)
+
+        guard let stagedAccountID = try Self.accountID(from: Data(contentsOf: stagedAuth), path: stagedAuth.path) else {
+            throw ManagedCodexHomeStoreError.invalidAuthType(stagedAuth.path)
+        }
 
         let targetAuth = home.appendingPathComponent("auth.json")
         let targetInfo = try AppOwnedPathSafety.info(at: targetAuth)
@@ -240,6 +259,7 @@ struct ManagedCodexHomeStore: @unchecked Sendable {
         // rename preserves the already-validated 0600 mode of the staged inode. There is no
         // fallible post-replacement mutation that could report failure after the old credential
         // has been replaced.
+        return stagedAccountID
     }
 
     func removeAccountHome(for accountID: UUID) throws {
@@ -432,6 +452,44 @@ struct ManagedCodexHomeStore: @unchecked Sendable {
     private static func nonEmptyString(_ value: Any?) -> Bool {
         guard let value = value as? String else { return false }
         return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private static func normalizedString(_ value: Any?) -> String? {
+        guard let value = value as? String else { return nil }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private static func accountID(from data: Data, path: String) throws -> String? {
+        guard data.count <= 1_000_000,
+              let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]),
+              let dictionary = object as? [String: Any],
+              let tokens = dictionary["tokens"] as? [String: Any],
+              let access = self.normalizedString(tokens["access_token"])
+        else { throw ManagedCodexHomeStoreError.invalidAuthType(path) }
+        let declared = self.normalizedString(tokens["account_id"])
+        if tokens["account_id"] != nil && declared == nil {
+            throw ManagedCodexHomeStoreError.invalidAuthType(path)
+        }
+        let tokenAccountID = self.jwtAccountID(access)
+        if let declared, let tokenAccountID, declared != tokenAccountID {
+            throw ManagedCodexHomeStoreError.invalidAuthType(path)
+        }
+        return declared ?? tokenAccountID
+    }
+
+    private static func jwtAccountID(_ token: String) -> String? {
+        let parts = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3 else { return nil }
+        var encoded = String(parts[1]).replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        encoded += String(repeating: "=", count: (4 - encoded.count % 4) % 4)
+        guard let data = Data(base64Encoded: encoded),
+              let object = try? JSONSerialization.jsonObject(with: data, options: []),
+              let payload = object as? [String: Any],
+              let auth = payload["https://api.openai.com/auth"] as? [String: Any]
+        else { return nil }
+        return self.normalizedString(auth["chatgpt_account_id"] ?? auth["account_id"])
     }
 }
 

@@ -54,7 +54,7 @@ On Linux, install the Node bundle and launcher (no Swift runtime is required):
 $HOME/bin/llm-usage codex --json
 ```
 
-Requirements are Node 20 or newer and a compatible local Codex executable providing `app-server`. The standalone CLI keeps its existing Pi-managed Codex compatibility path; the macOS app uses only accounts added under Managed Codex accounts. Override the destination with `LLM_USAGE_INSTALL_DIR`.
+Requirements are Node 20 or newer and a compatible local Codex executable providing `app-server`. The standalone CLI keeps its existing Pi-managed Codex compatibility path; the macOS app normally uses accounts added under Managed Codex accounts, with an explicit Pi handoff available for the selected account. Override the destination with `LLM_USAGE_INSTALL_DIR`.
 
 The Node CLI can verify local Codex prerequisites without starting an app-server or printing credentials:
 
@@ -67,6 +67,15 @@ llm-usage diagnose
 ```bash
 llm-usage codex --codex-home "$HOME/.llm-usage-bar/codex-accounts/<profile-id>" --json
 ```
+
+Reset consumption is account-bound and requires the expected ChatGPT account identity in the same app-server operation:
+
+```bash
+llm-usage codex reset consume --credit-id ID --idempotency-key KEY \
+  --expected-account-id CHATGPT_ACCOUNT_ID --codex-home PATH --json
+```
+
+The command refuses an unbound reset request. The macOS app supplies the identity recorded for the selected managed profile; an active Pi handoff uses Pi's locked auth path and validates the identity again immediately before consumption. If the installed app-server does not return an account identity, reset consumption is disabled rather than guessed.
 
 ## Config
 
@@ -82,6 +91,7 @@ Example:
   "codexEnabled" : true,
   "codexManagedAccounts" : [],
   "codexPrimaryAccountID" : null,
+  "codexPiHandoffAccountID" : null,
   "openCodeCookieHeader" : null,
   "openCodeEnabled" : true,
   "openCodeWorkspaceID" : null,
@@ -106,7 +116,15 @@ Use **Settings → Managed Codex accounts → Add Codex account…** to add more
 
 The profile label and identity metadata are stored in `config.json`; credentials stay in that profile's `auth.json`. Homes are restricted to the owning user and `auth.json` is restricted to mode `0600`. Login runs the installed `codex login` in a temporary staging `CODEX_HOME`; only a validated ChatGPT OAuth `auth.json` is atomically installed after a successful login. Cancellation, validation failure, and CLI failure leave the previous live credentials untouched. If the CLI prints an OpenAI HTTPS OAuth URL instead of opening a browser, the app safely opens that URL without displaying bearer/JWT tokens. Usage then launches `codex app-server` with the same managed `CODEX_HOME`, calls native `account/read` and `account/rateLimits/read`, and keeps session/weekly limits independent for every account. Removing an account uses a recoverable home quarantine and commits metadata only when credential cleanup can be completed; failures are reported rather than hidden.
 
-The menu shows only managed accounts as labelled Codex sections. The first managed account becomes primary; selecting an unavailable account fails closed rather than switching to another account. Managed flows never read or write Pi auth or the user's default Codex credentials.
+The menu shows only managed accounts as labelled Codex sections. The first managed account becomes primary; selecting an unavailable account fails closed rather than switching to another account. Managed accounts normally use their isolated native homes and never use the user's default Codex credentials.
+
+### Use a managed Codex account in Pi
+
+Settings → Managed Codex accounts → **Use this account in Pi…** performs an explicit credential handoff. The selected account is written as Pi's `openai-codex` OAuth entry in `~/.pi/agent/auth.json`; its managed `auth.json` is removed while active, so there is only one independently-refreshing live credential. Other managed accounts remain in their isolated native homes. The active account's usage and reset actions fetch through Pi auth, not its managed home.
+
+Before switching, exit running Pi sessions. Resume or restart them after the confirmation so they reload the selected account. When switching to another managed account, LLM Usage Bar first saves the latest Pi access/refresh tokens back to the matching inactive managed home, then atomically activates the target. An existing Pi `openai-codex` credential for a different ChatGPT account is rejected rather than overwritten; unrelated provider entries are preserved. **Stop using this account in Pi…** moves the latest tokens back and removes the Pi entry.
+
+Handoff state and account identity metadata are recorded in `config.json`; credential files are restricted to the owning user (`0700` directories, `0600` files), protected by Pi's mkdir-lock protocol with an inode-checked heartbeat, validated for account identity, and written atomically. ConfigStore saves—including handoff commits—share a kernel-owned `config.json.lock` across the complete comparison and replacement; lock paths are never deleted as stale. An existing Pi lock is treated as busy, and any inode replacement aborts the transaction rather than being silently ignored. Exact credential and Pi snapshots are journaled for recovery; a changed Pi/config document, missing or corrupt rollback snapshot, or unsafe symlink causes the operation to fail closed and, once a journal exists, leaves it for recovery. After a committed or rolled-back invariant is proven, the journal is removed before best-effort deletion of nonessential backups, so a partial cleanup can leave only a protected orphan backup—not a journal referring to deleted recovery data.
 
 Node must be discoverable from common paths, your login shell, or `LLM_BAR_NODE_PATH`.
 
@@ -131,6 +149,7 @@ Menu settings:
 Notes:
 
 - Pi totals are based on assistant message `usage.cost.total` values saved in session JSONL files.
+- A managed Codex account handed off to Pi is also the source used for the app's Codex usage refresh; it is not read from the inactive managed home.
 - Fork dedupe avoids double-counting copied history in forked session files by ignoring entries older than the fork session header timestamp.
 - If a model/provider had missing pricing metadata when a session was recorded, some rows may appear as zero-cost.
 

@@ -110,6 +110,8 @@ final class AppState {
     private(set) var isRefreshing = false
     private(set) var isAuthenticatingCodexAccount = false
     private(set) var authenticatingCodexAccountID: UUID?
+    private(set) var isHandingOffCodexAccount = false
+    private(set) var handoffRecoveryError: String?
     private var isRedeemingCodexReset = false
     private var pendingCodexResetRedemption: PendingCodexResetRedemption?
     private var codexResetRefreshRequired = Set<String>()
@@ -117,6 +119,7 @@ final class AppState {
     private let codexFetcher = CodexNodeBridge()
     private let codexLoginRunner = CodexLoginRunner()
     private let managedHomeStore = ManagedCodexHomeStore()
+    private let piCodexHandoff = PiCodexCredentialHandoff()
     private let openCodeFetcher = OpenCodeGoFetcher()
     private let piFetcher = PiSessionsFetcher()
     private var config: AppConfig
@@ -130,6 +133,11 @@ final class AppState {
                 for: Set(config.codexManagedAccounts.map(\.id)))
         } catch {
             AppLog.error("Managed Codex removal recovery failed: \(error.localizedDescription)")
+        }
+        do {
+            try self.piCodexHandoff.recoverIfNeeded(config: self.config)
+        } catch {
+            self.recordHandoffFailureIfJournalRemains(error)
         }
     }
 
@@ -150,6 +158,23 @@ final class AppState {
         self.config.codexManagedAccounts
     }
 
+    var piHandoffAccountID: UUID? {
+        self.config.codexPiHandoffAccountID
+    }
+
+    var piHandoffStatus: String {
+        if let error = self.handoffRecoveryError {
+            return "Pi handoff needs recovery: \(error)"
+        }
+        guard let id = self.config.codexPiHandoffAccountID else {
+            return "No managed Codex account is active in Pi"
+        }
+        guard let profile = self.config.codexManagedAccounts.first(where: { $0.id == id }) else {
+            return "Pi handoff needs recovery"
+        }
+        return "Active in Pi: \(profile.label)"
+    }
+
     @discardableResult
     func persistConfig(_ config: AppConfig) -> Bool {
         guard ConfigStore.save(config) else { return false }
@@ -160,6 +185,12 @@ final class AppState {
     func reloadConfig() {
         self.config = ConfigStore.load()
         self.normalizePrimaryCodexAccount()
+        do {
+            try self.piCodexHandoff.recoverIfNeeded(config: self.config)
+            self.handoffRecoveryError = nil
+        } catch {
+            self.recordHandoffFailureIfJournalRemains(error)
+        }
         self.applyPrimaryCodexSelectionToSnapshot()
     }
 
@@ -193,7 +224,7 @@ final class AppState {
     }
 
     var isCodexAccountOperationInProgress: Bool {
-        self.isRefreshing || self.isRedeemingCodexReset || self.isAuthenticatingCodexAccount
+        self.isRefreshing || self.isRedeemingCodexReset || self.isAuthenticatingCodexAccount || self.isHandingOffCodexAccount
     }
 
     func canRedeemCodexResets(for accountID: String) -> Bool {
@@ -256,6 +287,13 @@ final class AppState {
         guard self.config.codexManagedAccounts.contains(where: { $0.id == id }) else {
             throw ManagedCodexAccountError.accountNotFound
         }
+        guard self.config.codexPiHandoffAccountID != id else {
+            throw PiCodexCredentialHandoffError.handoffStateInvalid(
+                "sign in again is disabled while this account is active in Pi; release the Pi handoff first")
+        }
+        if let handoffRecoveryError {
+            throw PiCodexCredentialHandoffError.recoveryRequired(handoffRecoveryError)
+        }
 
         self.isAuthenticatingCodexAccount = true
         self.authenticatingCodexAccountID = id
@@ -275,10 +313,15 @@ final class AppState {
                 throw ManagedCodexAccountError.loginFailed(result)
             }
             try Task.checkCancellation()
-            try self.managedHomeStore.commitStagedAuth(for: id, stagingHome: stagingHome)
+            let authenticatedAccountID = try self.managedHomeStore.commitStagedAuth(for: id, stagingHome: stagingHome)
             try self.managedHomeStore.removeLoginStagingHome(stagingHome, accountID: id)
             shouldCleanStaging = false
-            guard self.updateManagedAccountMetadata(id: id, email: nil, planType: nil, authenticatedNow: true) else {
+            guard self.updateManagedAccountMetadata(
+                id: id,
+                email: nil,
+                planType: nil,
+                accountID: authenticatedAccountID,
+                authenticatedNow: true) else {
                 throw ManagedCodexAccountError.configWriteFailed
             }
         } catch {
@@ -303,6 +346,10 @@ final class AppState {
         }
         guard self.config.codexManagedAccounts.contains(where: { $0.id == id }) else {
             throw ManagedCodexAccountError.accountNotFound
+        }
+        guard self.config.codexPiHandoffAccountID != id else {
+            throw PiCodexCredentialHandoffError.handoffStateInvalid(
+                "release the Pi handoff before removing this account")
         }
         if let pending = self.pendingCodexResetRedemption, pending.accountID == id.uuidString {
             throw ManagedCodexAccountError.resetPending(
@@ -358,12 +405,128 @@ final class AppState {
     }
 
     @discardableResult
-    func updateManagedAccountMetadata(id: UUID, email: String?, planType: String?, authenticatedNow: Bool = false) -> Bool {
+    func useManagedCodexAccountInPi(id: UUID) async throws -> String? {
+        guard !self.isCodexAccountOperationInProgress else {
+            throw ManagedCodexAccountError.accountOperationInProgress
+        }
+        guard self.config.codexManagedAccounts.contains(where: { $0.id == id }) else {
+            throw PiCodexCredentialHandoffError.accountNotFound
+        }
+        if let handoffRecoveryError {
+            throw PiCodexCredentialHandoffError.recoveryRequired(handoffRecoveryError)
+        }
+        let configAtStart = self.config
+        guard let expectedConfig = ConfigStore.diskSnapshot(matching: configAtStart) else {
+            throw PiCodexCredentialHandoffError.concurrentChange(
+                "the managed-account configuration on disk is stale")
+        }
+
+        self.isHandingOffCodexAccount = true
+        defer { self.isHandingOffCodexAccount = false }
+        let handoff = self.piCodexHandoff
+        let result: PiCodexHandoffResult
+        do {
+            result = try await Task.detached(priority: .utility) {
+                try handoff.activate(
+                    accountID: id,
+                    config: configAtStart,
+                    saveConfig: { next in
+                        ConfigStore.saveIfUnchanged(next, expected: expectedConfig)
+                    })
+            }.value
+        } catch {
+            self.recordHandoffFailureIfJournalRemains(error)
+            throw error
+        }
+        self.config = result.config
+        if let warning = result.warning,
+           let journalInfo = try? AppOwnedPathSafety.info(at: self.piCodexHandoff.journalURL),
+           journalInfo.exists
+        {
+            self.handoffRecoveryError = warning
+        } else {
+            // A journal-first cleanup failure leaves only a nonessential protected backup; it does
+            // not block future handoffs because there is no recovery authority left to replay.
+            self.handoffRecoveryError = nil
+        }
+        self.applyPrimaryCodexSelectionToSnapshot()
+        return result.warning
+    }
+
+    @discardableResult
+    func releaseManagedCodexAccountFromPi(id: UUID) async throws -> String? {
+        guard !self.isCodexAccountOperationInProgress else {
+            throw ManagedCodexAccountError.accountOperationInProgress
+        }
+        guard self.config.codexPiHandoffAccountID == id else {
+            throw PiCodexCredentialHandoffError.handoffStateInvalid("this account is not active in Pi")
+        }
+        if let handoffRecoveryError {
+            throw PiCodexCredentialHandoffError.recoveryRequired(handoffRecoveryError)
+        }
+        let configAtStart = self.config
+        guard let expectedConfig = ConfigStore.diskSnapshot(matching: configAtStart) else {
+            throw PiCodexCredentialHandoffError.concurrentChange(
+                "the managed-account configuration on disk is stale")
+        }
+
+        self.isHandingOffCodexAccount = true
+        defer { self.isHandingOffCodexAccount = false }
+        let handoff = self.piCodexHandoff
+        let result: PiCodexHandoffResult
+        do {
+            result = try await Task.detached(priority: .utility) {
+                try handoff.deactivate(
+                    accountID: id,
+                    config: configAtStart,
+                    saveConfig: { next in
+                        ConfigStore.saveIfUnchanged(next, expected: expectedConfig)
+                    })
+            }.value
+        } catch {
+            self.recordHandoffFailureIfJournalRemains(error)
+            throw error
+        }
+        self.config = result.config
+        if let warning = result.warning,
+           let journalInfo = try? AppOwnedPathSafety.info(at: self.piCodexHandoff.journalURL),
+           journalInfo.exists
+        {
+            self.handoffRecoveryError = warning
+        } else {
+            self.handoffRecoveryError = nil
+        }
+        self.applyPrimaryCodexSelectionToSnapshot()
+        return result.warning
+    }
+
+    private func recordHandoffFailureIfJournalRemains(_ error: Error) {
+        guard let info = try? AppOwnedPathSafety.info(at: self.piCodexHandoff.journalURL),
+              info.exists else {
+            self.handoffRecoveryError = nil
+            return
+        }
+        self.handoffRecoveryError = error.localizedDescription
+        AppLog.error("Pi Codex handoff requires recovery: \(error.localizedDescription)")
+    }
+
+    @discardableResult
+    func updateManagedAccountMetadata(
+        id: UUID,
+        email: String?,
+        planType: String?,
+        accountID: String? = nil,
+        authenticatedNow: Bool = false) -> Bool
+    {
         guard var profile = self.config.codexManagedAccounts.first(where: { $0.id == id }) else { return false }
         var next = self.config
         guard let index = next.codexManagedAccounts.firstIndex(where: { $0.id == id }) else { return false }
         profile.email = email ?? profile.email
         profile.planType = planType ?? profile.planType
+        if let accountID, !accountID.isEmpty {
+            if let existing = profile.accountID, existing != accountID { return false }
+            profile.accountID = accountID
+        }
         if authenticatedNow { profile.lastAuthenticatedAt = Date() }
         next.codexManagedAccounts[index] = profile
         guard ConfigStore.save(next) else { return false }
@@ -599,7 +762,31 @@ final class AppState {
     }
 
     private func fetchManagedCodexAccount(id: UUID) async throws -> CodexSnapshot {
+        if self.config.codexPiHandoffAccountID == id {
+            guard let profile = self.config.codexManagedAccounts.first(where: { $0.id == id }) else {
+                throw PiCodexCredentialHandoffError.handoffStateInvalid("the active profile is missing")
+            }
+            try self.piCodexHandoff.validateActiveCredential(for: profile)
+            let usage = try await self.codexFetcher.fetchPiAuth()
+            // Pi may refresh the credential while the app-server is running. Validate the
+            // resulting file too, so an external replacement cannot silently change identity.
+            try self.piCodexHandoff.validateActiveCredential(for: profile)
+            return usage
+        }
+
         try self.managedHomeStore.secureAuthFile(for: id)
+        if let profile = self.config.codexManagedAccounts.first(where: { $0.id == id }),
+           profile.accountID == nil,
+           let discoveredAccountID = try self.managedHomeStore.accountID(for: id)
+        {
+            guard self.updateManagedAccountMetadata(
+                id: id,
+                email: nil,
+                planType: nil,
+                accountID: discoveredAccountID) else {
+                throw PiCodexCredentialHandoffError.configSaveFailed
+            }
+        }
         do {
             let usage = try await self.codexFetcher.fetchManaged(codexHome: self.managedHomeStore.homeURL(for: id))
             try self.managedHomeStore.secureAuthFile(for: id)
@@ -623,11 +810,41 @@ final class AppState {
 
     private func consumeCodexCredit(accountID: String, creditID: String, idempotencyKey: String) async throws -> String {
         guard let id = UUID(uuidString: accountID),
-              self.config.codexManagedAccounts.contains(where: { $0.id == id })
+              let profile = self.config.codexManagedAccounts.first(where: { $0.id == id })
         else { throw CodexResetRedemptionError.accountUnavailable }
+
+        let expectedChatGPTAccountID: String
+        if self.config.codexPiHandoffAccountID == id {
+            guard let profileAccountID = profile.accountID, !profileAccountID.isEmpty else {
+                throw CodexResetRedemptionError.accountUnavailable
+            }
+            try self.piCodexHandoff.validateActiveCredential(for: profile)
+            expectedChatGPTAccountID = profileAccountID
+            return try await self.codexFetcher.consumeResetCredit(
+                creditID: creditID,
+                idempotencyKey: idempotencyKey,
+                expectedChatGPTAccountID: expectedChatGPTAccountID,
+                codexHome: nil)
+        }
+
+        let discoveredAccountID = try self.managedHomeStore.accountID(for: id)
+        guard let profileAccountID = profile.accountID ?? discoveredAccountID,
+              !profileAccountID.isEmpty
+        else { throw CodexResetRedemptionError.accountUnavailable }
+        if profile.accountID == nil {
+            guard self.updateManagedAccountMetadata(
+                id: id,
+                email: nil,
+                planType: nil,
+                accountID: profileAccountID) else {
+                throw CodexResetRedemptionError.accountUnavailable
+            }
+        }
+        expectedChatGPTAccountID = profileAccountID
         return try await self.codexFetcher.consumeResetCredit(
             creditID: creditID,
             idempotencyKey: idempotencyKey,
+            expectedChatGPTAccountID: expectedChatGPTAccountID,
             codexHome: self.managedHomeStore.homeURL(for: id))
     }
 

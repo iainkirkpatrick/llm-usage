@@ -46,16 +46,18 @@ export function parseArgs(args) {
     seen.add(key);
     if (key === "--json") { values.json = true; continue; }
     if (key === "--codex-home") { i = parseCodexHomeOption(args, i, values); continue; }
-    if (key !== "--credit-id" && key !== "--idempotency-key") throw new Error(`Unknown argument: ${key}`);
+    if (key !== "--credit-id" && key !== "--idempotency-key" && key !== "--expected-account-id") throw new Error(`Unknown argument: ${key}`);
     const value = args[++i];
     if (!value || value.startsWith("--")) throw new Error(`Missing value for ${key}`);
-    if (key === "--credit-id") values.creditId = value; else values.idempotencyKey = value;
+    if (key === "--credit-id") values.creditId = value;
+    else if (key === "--idempotency-key") values.idempotencyKey = value;
+    else values.expectedChatgptAccountId = value;
   }
   return values;
 }
 
 export function help() {
-  return "Usage: llm-usage codex [--json] [--codex-home PATH | --all-managed]\n       llm-usage codex reset consume --credit-id ID --idempotency-key KEY [--codex-home PATH] --json\n       llm-usage diagnose [--json]\n       llm-usage help";
+  return "Usage: llm-usage codex [--json] [--codex-home PATH | --all-managed]\n       llm-usage codex reset consume --credit-id ID --idempotency-key KEY --expected-account-id ID [--codex-home PATH] --json\n       llm-usage diagnose [--json]\n       llm-usage help";
 }
 
 async function main(argv = process.argv.slice(2)) {

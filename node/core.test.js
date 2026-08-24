@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { classifyWindows, diagnose, fetchAllManagedUsage, fetchUsage, makeUsage } from "./core.js";
+import { classifyWindows, consumeCredit, diagnose, fetchAllManagedUsage, fetchUsage, makeUsage } from "./core.js";
 import { parseArgs } from "./cli.js";
 
 test("classifies duration windows and preserves primary/secondary fallback", () => {
@@ -155,6 +155,26 @@ exec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)}
     const firstManagedSelected = await fetchAllManagedUsage({ configPath, timeoutMs: 2_000 });
     assert.equal(firstManagedSelected.codex.source, "Managed Codex");
     assert.equal(firstManagedSelected.codexAccounts.find(account => account.id === first)?.usage?.source, "Managed Codex");
+
+    const piAuthPath = path.join(root, "pi-auth.json");
+    fs.writeFileSync(piAuthPath, JSON.stringify({
+      "openai-codex": {
+        type: "oauth",
+        access: "pi-access",
+        refresh: "pi-refresh",
+        expires: Date.now() + 60_000,
+        accountId: second
+      }
+    }));
+    process.env.LLM_BAR_PI_AUTH_PATH = path.join(root, "wrong-pi-auth.json");
+    fs.writeFileSync(configPath, JSON.stringify({
+      codexManagedAccounts: [{ id: first, label: "First" }, { id: second, label: "Second", accountID: second }],
+      codexPrimaryAccountID: second,
+      codexPiHandoffAccountID: second
+    }));
+    const handedOff = await fetchAllManagedUsage({ configPath, authPath: piAuthPath, timeoutMs: 2_000 });
+    assert.equal(handedOff.codexAccounts.find(account => account.id === second)?.usage?.source, "Pi auth");
+    assert.equal(handedOff.codexAccounts.find(account => account.id === first)?.usage?.source, "Managed Codex");
   } finally {
     if (previousExecutable === undefined) delete process.env.LLM_BAR_CODEX_PATH;
     else process.env.LLM_BAR_CODEX_PATH = previousExecutable;
@@ -164,12 +184,71 @@ exec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)}
   }
 });
 
+test("reset consumption validates the expected account before the irreversible RPC", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "llm-usage-node-consume-account-test-"));
+  const home = path.join(root, "managed-home");
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(path.join(home, "auth.json"), JSON.stringify({
+    OPENAI_API_KEY: null,
+    tokens: { access_token: "managed-access", refresh_token: "managed-refresh", account_id: "managed-account" }
+  }));
+  fs.chmodSync(path.join(home, "auth.json"), 0o600);
+  const executable = path.join(root, "fake-codex.sh");
+  const script = path.join(root, "fake-codex.mjs");
+  const calls = path.join(root, "calls.log");
+  fs.writeFileSync(script, `import fs from "node:fs";
+import readline from "node:readline";
+const calls = ${JSON.stringify(calls)};
+const lines = readline.createInterface({ input: process.stdin });
+lines.on("line", line => {
+  const message = JSON.parse(line);
+  if (message.id == null) return;
+  fs.appendFileSync(calls, message.method + "\\n");
+  let result = {};
+  if (message.method === "account/read") result = { account: { accountId: "managed-account", email: "managed@example.com" } };
+  if (message.method === "account/rateLimitResetCredit/consume") result = { outcome: "reset" };
+  process.stdout.write(JSON.stringify({ id: message.id, result }) + "\\n");
+});
+`);
+  fs.writeFileSync(executable, `#!/bin/sh
+exec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)}
+`);
+  fs.chmodSync(executable, 0o700);
+  const previous = process.env.LLM_BAR_CODEX_PATH;
+  process.env.LLM_BAR_CODEX_PATH = executable;
+  try {
+    const result = await consumeCredit({
+      creditId: "credit",
+      idempotencyKey: "attempt",
+      expectedChatgptAccountId: "managed-account",
+      codexHome: home,
+      timeoutMs: 2_000
+    });
+    assert.equal(result.outcome, "reset");
+    assert.deepEqual(fs.readFileSync(calls, "utf8").trim().split("\n"), [
+      "initialize", "account/read", "account/rateLimitResetCredit/consume"
+    ]);
+    await assert.rejects(
+      consumeCredit({ creditId: "credit", idempotencyKey: "other", expectedChatgptAccountId: "other-account", codexHome: home }),
+      /different ChatGPT account/
+    );
+    await assert.rejects(
+      consumeCredit({ creditId: "credit", idempotencyKey: "unbound", codexHome: home }),
+      /expected-account-id is required/
+    );
+  } finally {
+    if (previous === undefined) delete process.env.LLM_BAR_CODEX_PATH;
+    else process.env.LLM_BAR_CODEX_PATH = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("parses managed Codex home without changing the compatibility command", () => {
   assert.deepEqual(parseArgs(["codex", "--json"]), { command: "codex", json: true });
   assert.deepEqual(parseArgs(["codex", "--all-managed", "--json"]), { command: "codex", allManaged: true, json: true });
   assert.deepEqual(parseArgs(["codex", "--codex-home", "/tmp/account", "--json"]), { command: "codex", codexHome: "/tmp/account", json: true });
-  assert.deepEqual(parseArgs(["codex", "reset", "consume", "--credit-id", "c", "--idempotency-key", "k", "--json"]), { command: "consume", creditId: "c", idempotencyKey: "k", json: true });
-  assert.deepEqual(parseArgs(["codex", "reset", "consume", "--credit-id", "c", "--idempotency-key", "k", "--codex-home", "/tmp/account", "--json"]), { command: "consume", creditId: "c", idempotencyKey: "k", codexHome: "/tmp/account", json: true });
+  assert.deepEqual(parseArgs(["codex", "reset", "consume", "--credit-id", "c", "--idempotency-key", "k", "--expected-account-id", "chatgpt-account", "--json"]), { command: "consume", creditId: "c", idempotencyKey: "k", expectedChatgptAccountId: "chatgpt-account", json: true });
+  assert.deepEqual(parseArgs(["codex", "reset", "consume", "--credit-id", "c", "--idempotency-key", "k", "--expected-account-id", "chatgpt-account", "--codex-home", "/tmp/account", "--json"]), { command: "consume", creditId: "c", idempotencyKey: "k", expectedChatgptAccountId: "chatgpt-account", codexHome: "/tmp/account", json: true });
 });
 
 test("all-managed returns a managed-account prompt without reading Pi auth when unconfigured", async () => {
