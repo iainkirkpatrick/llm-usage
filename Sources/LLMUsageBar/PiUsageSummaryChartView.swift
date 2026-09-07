@@ -19,12 +19,15 @@ final class PiUsageSummaryChartView: NSView {
     private static let sectionGap: CGFloat = 6
     private static let topInset: CGFloat = 10
     private static let viewHeight: CGFloat = 180
+    private static let hoverAccessibilityHelp = "Move the pointer over a day in the chart to inspect its exact local date and token count."
 
     private let summaries: [Summary]
     private let buckets: [PiDailyUsageBucket]
     private let peakTokens: Int
     private let viewSize: NSSize
     private let accessibilitySummary: String
+    private var trackingArea: NSTrackingArea?
+    private var hoveredBucketIndex: Int?
 
     init(summaries: [Summary], buckets: [PiDailyUsageBucket]) {
         let viewSummaries = Array(summaries.prefix(4))
@@ -45,6 +48,7 @@ final class PiUsageSummaryChartView: NSView {
         self.setAccessibilityRole(.group)
         self.setAccessibilityLabel("Pi usage summaries and 90-day token usage chart")
         self.setAccessibilityValue(self.accessibilitySummary)
+        self.setAccessibilityHelp(Self.hoverAccessibilityHelp)
         self.toolTip = self.accessibilitySummary
     }
 
@@ -56,14 +60,63 @@ final class PiUsageSummaryChartView: NSView {
         self.viewSize
     }
 
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+
+        if let trackingArea = self.trackingArea {
+            self.removeTrackingArea(trackingArea)
+            self.trackingArea = nil
+        }
+
+        guard let window = self.window else { return }
+
+        // Menu windows are not consistently key windows across macOS versions.
+        // activeAlways keeps inspection working while the menu is being tracked.
+        window.acceptsMouseMovedEvents = true
+        let options: NSTrackingArea.Options = [
+            .mouseEnteredAndExited,
+            .mouseMoved,
+            .activeAlways,
+            .inVisibleRect,
+        ]
+        let trackingArea = NSTrackingArea(
+            rect: self.bounds,
+            options: options,
+            owner: self,
+            userInfo: nil)
+        self.addTrackingArea(trackingArea)
+        self.trackingArea = trackingArea
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+
+        guard self.window != nil else {
+            self.setHoveredBucket(nil)
+            return
+        }
+        self.window?.acceptsMouseMovedEvents = true
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        self.updateHoveredBucket(at: self.convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        self.updateHoveredBucket(at: self.convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        self.setHoveredBucket(nil)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
-        let chartRect = NSRect(
-            x: 0,
-            y: 0,
-            width: self.bounds.width,
-            height: min(Self.chartHeight, self.bounds.height))
+        let chartRect = self.chartRect()
         let summaryRect = NSRect(
             x: 0,
             y: chartRect.maxY + Self.sectionGap,
@@ -132,12 +185,7 @@ final class PiUsageSummaryChartView: NSView {
     private func drawChart(in chartRect: NSRect) {
         guard chartRect.width > 0, chartRect.height > 0 else { return }
 
-        let horizontalInset = Self.horizontalInset
-        let plotRect = NSRect(
-            x: horizontalInset,
-            y: 23,
-            width: max(1, chartRect.width - (horizontalInset * 2)),
-            height: max(1, chartRect.height - 50))
+        let plotRect = self.plotRect(in: chartRect)
 
         let headerGap: CGFloat = 8
         let headerWidth = max(1, (plotRect.width - headerGap) / 2)
@@ -171,10 +219,12 @@ final class PiUsageSummaryChartView: NSView {
         plotBackground.lineWidth = 0.5
         plotBackground.stroke()
 
+        self.drawHoverHighlight(in: plotRect)
         self.drawGrid(in: plotRect)
 
         let values = self.buckets.map { max(0, $0.totalTokens) }
         self.drawBars(values: values, in: plotRect)
+        self.drawHoverCallout(in: plotRect)
 
         let secondaryColor = NSColor.secondaryLabelColor
         let firstBucketLabel = self.buckets.first?.day.formatted(date: .abbreviated, time: .omitted) ?? "89d ago"
@@ -198,6 +248,268 @@ final class PiUsageSummaryChartView: NSView {
             minimumFontSize: 8,
             color: secondaryColor,
             alignment: .right)
+    }
+
+    private func chartRect() -> NSRect {
+        NSRect(
+            x: 0,
+            y: 0,
+            width: self.bounds.width,
+            height: min(Self.chartHeight, self.bounds.height))
+    }
+
+    private func plotRect(in chartRect: NSRect) -> NSRect {
+        NSRect(
+            x: Self.horizontalInset,
+            y: 23,
+            width: max(1, chartRect.width - (Self.horizontalInset * 2)),
+            height: max(1, chartRect.height - 50))
+    }
+
+    private func updateHoveredBucket(at location: NSPoint) {
+        self.setHoveredBucket(self.bucketIndex(at: location))
+    }
+
+    private func bucketIndex(at location: NSPoint) -> Int? {
+        guard !self.buckets.isEmpty else { return nil }
+
+        let plotRect = self.plotRect(in: self.chartRect())
+        guard plotRect.width > 0,
+              plotRect.height > 0,
+              location.x >= plotRect.minX,
+              location.x <= plotRect.maxX,
+              location.y >= plotRect.minY,
+              location.y <= plotRect.maxY
+        else {
+            return nil
+        }
+
+        let slotWidth = plotRect.width / CGFloat(self.buckets.count)
+        guard slotWidth.isFinite, slotWidth > 0 else { return nil }
+
+        let position = (location.x - plotRect.minX) / slotWidth
+        guard position.isFinite else { return nil }
+
+        // Clamp the right edge so a point exactly on plotRect.maxX still selects today.
+        let index = Int(position.rounded(.down))
+        return min(max(index, 0), self.buckets.count - 1)
+    }
+
+    private func setHoveredBucket(_ index: Int?) {
+        let normalizedIndex: Int?
+        if let index, self.buckets.indices.contains(index) {
+            normalizedIndex = index
+        } else {
+            normalizedIndex = nil
+        }
+
+        guard normalizedIndex != self.hoveredBucketIndex else { return }
+        self.hoveredBucketIndex = normalizedIndex
+        self.updateAccessibilityForHover()
+        self.needsDisplay = true
+    }
+
+    private func updateAccessibilityForHover() {
+        guard let index = self.hoveredBucketIndex,
+              self.buckets.indices.contains(index)
+        else {
+            self.setAccessibilityValue(self.accessibilitySummary)
+            self.setAccessibilityHelp(Self.hoverAccessibilityHelp)
+            self.toolTip = self.accessibilitySummary
+            return
+        }
+
+        let detail = Self.hoverDetail(for: self.buckets[index])
+        let hoverText = "Hovered day: \(detail)."
+        self.setAccessibilityValue("\(self.accessibilitySummary) \(hoverText)")
+        self.setAccessibilityHelp("\(hoverText) \(Self.hoverAccessibilityHelp)")
+        self.toolTip = "\(self.accessibilitySummary) \(hoverText)"
+    }
+
+    private func drawHoverHighlight(in plotRect: NSRect) {
+        guard let index = self.hoveredBucketIndex,
+              self.buckets.indices.contains(index)
+        else {
+            return
+        }
+
+        let slot = self.slotRect(for: index, count: self.buckets.count, in: plotRect)
+        let inset = min(0.5, min(slot.width, slot.height) / 2)
+        let highlightRect = slot.insetBy(dx: inset, dy: inset)
+        guard highlightRect.width > 0, highlightRect.height > 0 else { return }
+
+        let highlight = NSBezierPath(
+            roundedRect: highlightRect,
+            xRadius: min(2, highlightRect.width / 2),
+            yRadius: min(2, highlightRect.height / 2))
+        NSColor.controlAccentColor.withAlphaComponent(0.16).setFill()
+        highlight.fill()
+        NSColor.controlAccentColor.withAlphaComponent(0.55).setStroke()
+        highlight.lineWidth = 0.5
+        highlight.stroke()
+    }
+
+    private func drawHoverCallout(in plotRect: NSRect) {
+        guard let index = self.hoveredBucketIndex,
+              self.buckets.indices.contains(index)
+        else {
+            return
+        }
+
+        let bucket = self.buckets[index]
+        let dateText = Self.exactLocalDateLabel(bucket.day)
+        let tokenText = "\(Self.exactTokenCountLabel(max(0, bucket.totalTokens))) tokens"
+        let dateFont = NSFont.systemFont(ofSize: 9, weight: .semibold)
+        let tokenFont = NSFont.systemFont(ofSize: 10, weight: .medium)
+        let horizontalPadding: CGFloat = 8
+        let verticalPadding: CGFloat = 5
+        let dateLineHeight: CGFloat = 12
+        let tokenLineHeight: CGFloat = 14
+        let textWidth = max(
+            self.measure(dateText, with: dateFont).width,
+            self.measure(tokenText, with: tokenFont).width)
+        let desiredWidth = ceil(textWidth + (horizontalPadding * 2))
+        let desiredHeight = verticalPadding * 2 + dateLineHeight + tokenLineHeight
+
+        // Keep the complete callout inside the plot. This also leaves room for its
+        // shadow without letting it clip at either edge of the menu view.
+        let horizontalEdgeInset = min(2, plotRect.width / 2)
+        let verticalEdgeInset = min(2, plotRect.height / 2)
+        let availableRect = plotRect.insetBy(
+            dx: horizontalEdgeInset,
+            dy: verticalEdgeInset)
+        guard availableRect.width > 0, availableRect.height > 0 else { return }
+
+        let calloutWidth = min(availableRect.width, max(96, desiredWidth))
+        let calloutHeight = min(availableRect.height, desiredHeight)
+        let slot = self.slotRect(for: index, count: self.buckets.count, in: plotRect)
+        let barTop = self.barRect(
+            for: max(0, bucket.totalTokens),
+            at: index,
+            count: self.buckets.count,
+            in: plotRect)?.maxY ?? plotRect.minY
+        let gap: CGFloat = 4
+        let preferredY = barTop + gap
+        let fallbackY = barTop - calloutHeight - gap
+        let y = preferredY + calloutHeight <= availableRect.maxY ? preferredY : fallbackY
+        let requestedRect = NSRect(
+            x: slot.midX - (calloutWidth / 2),
+            y: y,
+            width: calloutWidth,
+            height: calloutHeight)
+        let calloutRect = Self.clamped(requestedRect, to: availableRect)
+
+        let path = NSBezierPath(
+            roundedRect: calloutRect,
+            xRadius: min(6, calloutRect.width / 2),
+            yRadius: min(6, calloutRect.height / 2))
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.24)
+        shadow.shadowBlurRadius = 3
+        shadow.shadowOffset = NSSize(width: 0, height: -1)
+
+        NSGraphicsContext.current?.saveGraphicsState()
+        shadow.set()
+        NSColor.controlBackgroundColor.withAlphaComponent(0.98).setFill()
+        path.fill()
+        NSGraphicsContext.current?.restoreGraphicsState()
+
+        NSColor.controlAccentColor.withAlphaComponent(0.72).setStroke()
+        path.lineWidth = 0.75
+        path.stroke()
+
+        let textRect = calloutRect.insetBy(dx: horizontalPadding, dy: verticalPadding)
+        self.drawFittedText(
+            dateText,
+            in: NSRect(
+                x: textRect.minX,
+                y: textRect.maxY - dateLineHeight,
+                width: textRect.width,
+                height: dateLineHeight),
+            fontSize: 9,
+            minimumFontSize: 7,
+            weight: .semibold,
+            color: .secondaryLabelColor)
+        self.drawFittedText(
+            tokenText,
+            in: NSRect(
+                x: textRect.minX,
+                y: textRect.minY,
+                width: textRect.width,
+                height: tokenLineHeight),
+            fontSize: 10,
+            minimumFontSize: 7,
+            weight: .medium,
+            color: .labelColor)
+    }
+
+    private func slotRect(for index: Int, count: Int, in plotRect: NSRect) -> NSRect {
+        let slotWidth = plotRect.width / CGFloat(count)
+        return NSRect(
+            x: plotRect.minX + (CGFloat(index) * slotWidth),
+            y: plotRect.minY,
+            width: slotWidth,
+            height: plotRect.height)
+    }
+
+    private func barRect(
+        for value: Int,
+        at index: Int,
+        count: Int,
+        in plotRect: NSRect
+    ) -> NSRect? {
+        let positiveValue = max(0, value)
+        guard positiveValue > 0,
+              self.peakTokens > 0,
+              count > 0,
+              index >= 0,
+              index < count
+        else {
+            return nil
+        }
+
+        let maximum = Double(self.peakTokens)
+        guard maximum.isFinite, maximum > 0 else { return nil }
+
+        let slotWidth = plotRect.width / CGFloat(count)
+        guard slotWidth.isFinite, slotWidth > 0 else { return nil }
+
+        let gap = min(1.5, slotWidth * 0.25)
+        let barWidth = max(0.75, slotWidth - gap)
+        let fraction = min(1.0, max(0, Double(positiveValue) / maximum))
+        guard fraction.isFinite else { return nil }
+
+        let barHeight = max(1.5, plotRect.height * CGFloat(fraction))
+        let slot = self.slotRect(for: index, count: count, in: plotRect)
+        return NSRect(
+            x: slot.minX + ((slot.width - barWidth) / 2),
+            y: plotRect.minY,
+            width: barWidth,
+            height: min(plotRect.height, barHeight))
+    }
+
+    private static func clamped(_ rect: NSRect, to bounds: NSRect) -> NSRect {
+        let width = min(max(0, rect.width), max(0, bounds.width))
+        let height = min(max(0, rect.height), max(0, bounds.height))
+        return NSRect(
+            x: min(max(rect.minX, bounds.minX), bounds.maxX - width),
+            y: min(max(rect.minY, bounds.minY), bounds.maxY - height),
+            width: width,
+            height: height)
+    }
+
+    private static func exactLocalDateLabel(_ date: Date) -> String {
+        date.formatted(date: .abbreviated, time: .omitted)
+    }
+
+    private static func exactTokenCountLabel(_ value: Int) -> String {
+        value.formatted(.number.grouping(.automatic))
+    }
+
+    private static func hoverDetail(for bucket: PiDailyUsageBucket) -> String {
+        let date = self.exactLocalDateLabel(bucket.day)
+        let tokens = self.exactTokenCountLabel(max(0, bucket.totalTokens))
+        return "\(date): \(tokens) tokens"
     }
 
     private func drawGrid(in plotRect: NSRect) {
@@ -230,31 +542,20 @@ final class PiUsageSummaryChartView: NSView {
             return
         }
 
-        let maximum = Double(self.peakTokens)
-        guard maximum.isFinite, maximum > 0 else { return }
-
-        // Keep every day discrete while leaving a small gap between adjacent bars.
-        let slotWidth = plotRect.width / CGFloat(values.count)
-        let gap = min(1.5, slotWidth * 0.25)
-        let barWidth = max(0.75, slotWidth - gap)
-        let minimumBarHeight: CGFloat = 1.5
         let todayIndex = values.index(before: values.endIndex)
-
         for (index, value) in values.enumerated() {
-            let positiveValue = max(0, value)
-            guard positiveValue > 0 else { continue }
+            guard let barRect = self.barRect(
+                for: value,
+                at: index,
+                count: values.count,
+                in: plotRect)
+            else {
+                continue
+            }
 
-            let fraction = min(1.0, max(0, Double(positiveValue) / maximum))
-            guard fraction.isFinite else { continue }
-            let barHeight = max(minimumBarHeight, plotRect.height * CGFloat(fraction))
-            let barRect = NSRect(
-                x: plotRect.minX + (CGFloat(index) * slotWidth) + ((slotWidth - barWidth) / 2),
-                y: plotRect.minY,
-                width: barWidth,
-                height: min(plotRect.height, barHeight))
             let bar = NSBezierPath(
                 roundedRect: barRect,
-                xRadius: min(1, barWidth / 2),
+                xRadius: min(1, barRect.width / 2),
                 yRadius: min(1, barRect.height / 2))
 
             // A slightly stronger final bar marks today without competing with the data.
