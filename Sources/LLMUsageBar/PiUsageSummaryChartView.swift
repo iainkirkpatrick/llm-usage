@@ -173,14 +173,8 @@ final class PiUsageSummaryChartView: NSView {
 
         self.drawGrid(in: plotRect)
 
-        let values = self.buckets.map { Double(max(0, $0.totalTokens)) }
-        let points = self.points(for: values, in: plotRect)
-        if self.peakTokens > 0, !points.isEmpty {
-            self.drawAreaAndLine(points: points, in: plotRect)
-            self.drawPeakMarkers(points: points, values: values)
-        } else {
-            self.drawBaseline(in: plotRect)
-        }
+        let values = self.buckets.map { max(0, $0.totalTokens) }
+        self.drawBars(values: values, in: plotRect)
 
         let secondaryColor = NSColor.secondaryLabelColor
         let firstBucketLabel = self.buckets.first?.day.formatted(date: .abbreviated, time: .omitted) ?? "89d ago"
@@ -231,59 +225,45 @@ final class PiUsageSummaryChartView: NSView {
         baseline.stroke()
     }
 
-    private func points(for values: [Double], in plotRect: NSRect) -> [NSPoint] {
-        guard !values.isEmpty else { return [] }
-
-        let finitePeak = Double(self.peakTokens)
-        let denominator = max(1, values.count - 1)
-        return values.enumerated().map { index, value in
-            let fraction: CGFloat
-            if finitePeak.isFinite, finitePeak > 0, value.isFinite {
-                fraction = CGFloat(min(1, max(0, value / finitePeak)))
-            } else {
-                fraction = 0
-            }
-            return NSPoint(
-                x: plotRect.minX + (plotRect.width * CGFloat(index) / CGFloat(denominator)),
-                y: plotRect.minY + (plotRect.height * fraction))
+    private func drawBars(values: [Int], in plotRect: NSRect) {
+        guard !values.isEmpty, self.peakTokens > 0, plotRect.width > 0, plotRect.height > 0 else {
+            return
         }
-    }
 
-    private func drawAreaAndLine(points: [NSPoint], in plotRect: NSRect) {
-        guard let first = points.first, let last = points.last else { return }
+        let maximum = Double(self.peakTokens)
+        guard maximum.isFinite, maximum > 0 else { return }
 
-        let area = NSBezierPath()
-        area.move(to: NSPoint(x: first.x, y: plotRect.minY))
-        area.line(to: first)
-        for point in points.dropFirst() {
-            area.line(to: point)
+        // Keep every day discrete while leaving a small gap between adjacent bars.
+        let slotWidth = plotRect.width / CGFloat(values.count)
+        let gap = min(1.5, slotWidth * 0.25)
+        let barWidth = max(0.75, slotWidth - gap)
+        let minimumBarHeight: CGFloat = 1.5
+        let todayIndex = values.index(before: values.endIndex)
+
+        for (index, value) in values.enumerated() {
+            let positiveValue = max(0, value)
+            guard positiveValue > 0 else { continue }
+
+            let fraction = min(1.0, max(0, Double(positiveValue) / maximum))
+            guard fraction.isFinite else { continue }
+            let barHeight = max(minimumBarHeight, plotRect.height * CGFloat(fraction))
+            let barRect = NSRect(
+                x: plotRect.minX + (CGFloat(index) * slotWidth) + ((slotWidth - barWidth) / 2),
+                y: plotRect.minY,
+                width: barWidth,
+                height: min(plotRect.height, barHeight))
+            let bar = NSBezierPath(
+                roundedRect: barRect,
+                xRadius: min(1, barWidth / 2),
+                yRadius: min(1, barRect.height / 2))
+
+            // A slightly stronger final bar marks today without competing with the data.
+            let color = index == todayIndex
+                ? NSColor.controlAccentColor
+                : NSColor.controlAccentColor.withAlphaComponent(0.58)
+            color.setFill()
+            bar.fill()
         }
-        area.line(to: NSPoint(x: last.x, y: plotRect.minY))
-        area.close()
-        NSColor.controlAccentColor.withAlphaComponent(0.13).setFill()
-        area.fill()
-
-        let line = NSBezierPath()
-        line.move(to: first)
-        for point in points.dropFirst() {
-            line.line(to: point)
-        }
-        line.lineWidth = 1.6
-        line.lineCapStyle = .round
-        line.lineJoinStyle = .round
-        NSColor.controlAccentColor.setStroke()
-        line.stroke()
-    }
-
-    private func drawPeakMarkers(points: [NSPoint], values: [Double]) {
-        guard let peak = values.max(), peak > 0, peak.isFinite,
-              let index = values.firstIndex(of: peak), index < points.count
-        else { return }
-
-        let point = points[index]
-        let marker = NSBezierPath(ovalIn: NSRect(x: point.x - 2.25, y: point.y - 2.25, width: 4.5, height: 4.5))
-        NSColor.controlAccentColor.setFill()
-        marker.fill()
     }
 
     private func drawFittedText(

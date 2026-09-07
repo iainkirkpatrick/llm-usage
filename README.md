@@ -148,7 +148,7 @@ Menu settings:
 
 Notes:
 
-- The Pi menu shows usage totals for today, the last 7d, the last 30d, and the last 90d, followed by a compact 90-day daily token line chart. The chart uses local calendar days, includes zero-usage days, and totals input, output, cache-read, and cache-write tokens.
+- The Pi menu shows usage totals for today, the last 7d, the last 30d, and the last 90d, followed by a compact 90-day daily token bar chart. The chart uses local calendar days, includes zero-usage days, and totals input, output, cache-read, and cache-write tokens.
 - Pi totals are based on assistant message `usage.cost.total` values saved in session JSONL files, plus completed subagent `provider_call` records from sibling `telemetry/events.jsonl` (by default `~/.pi/agent/telemetry/events.jsonl`) when the sessions directory uses the standard `.../sessions` layout.
 - Main telemetry calls are excluded because they are already represented by session rows; malformed or unavailable telemetry is ignored.
 - A managed Codex account handed off to Pi is also the source used for the app's Codex usage refresh; it is not read from the inactive managed home.
