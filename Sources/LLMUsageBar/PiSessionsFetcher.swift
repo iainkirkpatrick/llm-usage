@@ -11,7 +11,140 @@ enum PiSessionsError: LocalizedError {
     }
 }
 
-struct PiSessionsFetcher {
+struct PiSessionsFetcher: Sendable {
+    private final class TelemetryCache: @unchecked Sendable {
+        private struct FileMetadata {
+            let path: String
+            let resourceIdentifier: String?
+            let size: UInt64
+            let modificationDate: Date?
+        }
+
+        private let lock = NSLock()
+        private var metadata: FileMetadata?
+        private var byteOffset: UInt64 = 0
+        private var incompleteLine = Data()
+        private var rows: [PiUsageRow] = []
+
+        func rows(for fileURL: URL) -> [PiUsageRow] {
+            self.lock.lock()
+            defer { self.lock.unlock() }
+
+            guard let currentMetadata = try? Self.fileMetadata(for: fileURL) else {
+                // A missing or temporarily unreadable telemetry file must not make the
+                // fetch fail, and cached rows must not survive a removed file.
+                self.reset()
+                return []
+            }
+
+            if self.shouldReset(for: currentMetadata) {
+                self.reset()
+            }
+
+            do {
+                let result = try Self.readNewData(
+                    from: fileURL,
+                    offset: self.byteOffset,
+                    incompleteLine: self.incompleteLine)
+                self.byteOffset = result.offset
+                self.incompleteLine = result.incompleteLine
+                self.rows.append(contentsOf: result.rows)
+                self.metadata = (try? Self.fileMetadata(for: fileURL))
+                    ?? FileMetadata(
+                        path: currentMetadata.path,
+                        resourceIdentifier: currentMetadata.resourceIdentifier,
+                        size: result.offset,
+                        modificationDate: currentMetadata.modificationDate)
+            } catch {
+                // Telemetry is auxiliary data. Keep a previously parsed snapshot when a
+                // read fails, but do not turn the failure into a sessions fetch error.
+                return self.rows
+            }
+
+            return self.rows
+        }
+
+        private func reset() {
+            self.metadata = nil
+            self.byteOffset = 0
+            self.incompleteLine.removeAll(keepingCapacity: false)
+            self.rows.removeAll(keepingCapacity: false)
+        }
+
+        private func shouldReset(for current: FileMetadata) -> Bool {
+            guard let previous = self.metadata else { return false }
+            if previous.path != current.path {
+                return true
+            }
+            if previous.resourceIdentifier != current.resourceIdentifier,
+               previous.resourceIdentifier != nil || current.resourceIdentifier != nil
+            {
+                return true
+            }
+            if current.size < self.byteOffset {
+                return true
+            }
+            // If resource identifiers are unavailable (or an application rewrites a file
+            // in place), a changed timestamp at the same offset indicates replacement.
+            if current.size == self.byteOffset,
+               previous.modificationDate != current.modificationDate
+            {
+                return true
+            }
+            return false
+        }
+
+        private static func fileMetadata(for fileURL: URL) throws -> FileMetadata {
+            let values = try fileURL.resourceValues(forKeys: [
+                .isRegularFileKey, .fileResourceIdentifierKey, .fileSizeKey,
+                .contentModificationDateKey,
+            ])
+            guard values.isRegularFile == true, let fileSize = values.fileSize, fileSize >= 0 else {
+                throw CocoaError(.fileReadUnknown)
+            }
+            return FileMetadata(
+                path: fileURL.path,
+                resourceIdentifier: values.fileResourceIdentifier.map { String(describing: $0) },
+                size: UInt64(fileSize),
+                modificationDate: values.contentModificationDate)
+        }
+
+        private static func readNewData(
+            from fileURL: URL,
+            offset: UInt64,
+            incompleteLine: Data
+        ) throws -> (offset: UInt64, incompleteLine: Data, rows: [PiUsageRow]) {
+            let handle = try FileHandle(forReadingFrom: fileURL)
+            defer { try? handle.close() }
+            try handle.seek(toOffset: offset)
+
+            var nextOffset = offset
+            var buffered = incompleteLine
+            var rows: [PiUsageRow] = []
+
+            while true {
+                guard let chunk = try handle.read(upToCount: 64 * 1024), !chunk.isEmpty else {
+                    break
+                }
+                nextOffset += UInt64(chunk.count)
+                buffered.append(chunk)
+
+                guard let newline = buffered.lastIndex(of: 0x0A) else { continue }
+                let completeEnd = buffered.index(after: newline)
+                let completeData = buffered[..<completeEnd]
+                for rawLine in completeData.split(separator: 0x0A, omittingEmptySubsequences: true) {
+                    let lineData = Data(rawLine)
+                    if let row = PiSessionsFetcher.parseTelemetryRecord(lineData, fileURL: fileURL) {
+                        rows.append(row)
+                    }
+                }
+                buffered = Data(buffered[completeEnd...])
+            }
+
+            return (nextOffset, buffered, rows)
+        }
+    }
+
     private struct ParsedSession {
         let rows: [PiUsageRow]
         let isFork: Bool
@@ -20,36 +153,39 @@ struct PiSessionsFetcher {
 
     private let defaultSessionsDirectory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".pi/agent/sessions", isDirectory: true)
+    private let telemetryCache = TelemetryCache()
 
     func fetch(sessionsDirectory: String?, deduplicateForkHistory: Bool) throws -> PiSnapshot {
         let directoryURL = self.resolveSessionsDirectory(sessionsDirectory)
         let exists = FileManager.default.fileExists(atPath: directoryURL.path)
 
-        guard exists else {
-            return PiSnapshot(
-                sessionsDirectory: directoryURL.path,
-                rows: [],
-                sessionCount: 0,
-                forkedSessionCount: 0,
-                zeroCostRowCount: 0,
-                updatedAt: Date()
-            )
-        }
-
-        let files = try self.sessionFiles(at: directoryURL)
+        var files: [URL] = []
         var rows: [PiUsageRow] = []
         var forkedSessionCount = 0
         var zeroCostRowCount = 0
 
-        for fileURL in files {
-            guard let parsed = try? self.parseSessionFile(fileURL, deduplicateForkHistory: deduplicateForkHistory) else {
-                continue
+        if exists {
+            files = try self.sessionFiles(at: directoryURL)
+            for fileURL in files {
+                guard let parsed = try? self.parseSessionFile(fileURL, deduplicateForkHistory: deduplicateForkHistory) else {
+                    continue
+                }
+                rows.append(contentsOf: parsed.rows)
+                if parsed.isFork {
+                    forkedSessionCount += 1
+                }
+                zeroCostRowCount += parsed.zeroCostRowCount
             }
-            rows.append(contentsOf: parsed.rows)
-            if parsed.isFork {
-                forkedSessionCount += 1
+        }
+
+        // Session JSONL contains the main calls. Pi's telemetry is also where subagent calls
+        // are recorded, so only append the latter to avoid counting main calls twice.
+        let telemetryRows = self.parseTelemetryFile(at: self.telemetryFileURL(for: directoryURL))
+        rows.append(contentsOf: telemetryRows)
+        zeroCostRowCount += telemetryRows.reduce(into: 0) { count, row in
+            if row.totalTokens > 0 && row.costUSD == 0 {
+                count += 1
             }
-            zeroCostRowCount += parsed.zeroCostRowCount
         }
 
         rows.sort { $0.timeCreated > $1.timeCreated }
@@ -71,6 +207,62 @@ struct PiSessionsFetcher {
 
         let expanded = (rawPath as NSString).expandingTildeInPath
         return URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL
+    }
+
+    private func telemetryFileURL(for sessionsDirectory: URL) -> URL? {
+        guard sessionsDirectory.lastPathComponent == "sessions" else { return nil }
+        return sessionsDirectory
+            .deletingLastPathComponent()
+            .appendingPathComponent("telemetry/events.jsonl", isDirectory: false)
+    }
+
+    private func parseTelemetryFile(at fileURL: URL?) -> [PiUsageRow] {
+        guard let fileURL else { return [] }
+        return self.telemetryCache.rows(for: fileURL)
+    }
+
+    private static func parseTelemetryRecord(_ rawLine: Data, fileURL: URL) -> PiUsageRow? {
+        guard let dict = Self.jsonObject(from: rawLine),
+              (dict["type"] as? String) == "provider_call"
+        else {
+            return nil
+        }
+
+        let isSubagent = Self.normalizedString(dict["execution_scope"]) == "subagent"
+            || (Self.numericInt(dict["subagent_depth"]) ?? 0) > 0
+        guard isSubagent,
+              let timeCreated = Self.parseTelemetryDate(dict["message_completion_at"])
+                  ?? Self.parseTelemetryDate(dict["timestamp"]),
+              let inputTokens = Self.nonNegativeInt(dict["input"]),
+              let outputTokens = Self.nonNegativeInt(dict["output"])
+        else {
+            return nil
+        }
+
+        // Cache counters, totalTokens, and cost are absent from some finalized calls.
+        // They are optional usage details, whereas input/output plus a timestamp identify
+        // a usable provider call. Derive or zero-fill the optional values instead of
+        // discarding the entire record.
+        let cacheReadTokens = Self.nonNegativeInt(dict["cacheRead"]) ?? 0
+        let cacheWriteTokens = Self.nonNegativeInt(dict["cacheWrite"]) ?? 0
+        let totalTokens = Self.nonNegativeInt(dict["totalTokens"])
+            ?? inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
+        let cost = Self.nonNegativeDouble(dict["cost"]) ?? 0
+
+        return PiUsageRow(
+            timeCreated: timeCreated,
+            sessionFile: fileURL.path,
+            sessionID: Self.normalizedString(dict["session_id"]),
+            cwd: Self.normalizedString(dict["cwd"]),
+            provider: Self.normalizedString(dict["provider"]),
+            model: Self.normalizedString(dict["model"]),
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            cacheReadTokens: cacheReadTokens,
+            cacheWriteTokens: cacheWriteTokens,
+            totalTokens: totalTokens,
+            costUSD: cost
+        )
     }
 
     private func sessionFiles(at directoryURL: URL) throws -> [URL] {
@@ -170,8 +362,11 @@ struct PiSessionsFetcher {
     }
 
     private static func jsonObject(from rawLine: Substring) -> [String: Any]? {
-        let data = Data(rawLine.utf8)
-        guard let object = try? JSONSerialization.jsonObject(with: data, options: []),
+        self.jsonObject(from: Data(rawLine.utf8))
+    }
+
+    private static func jsonObject(from rawLine: Data) -> [String: Any]? {
+        guard let object = try? JSONSerialization.jsonObject(with: rawLine, options: []),
               let dict = object as? [String: Any]
         else {
             return nil
@@ -214,6 +409,10 @@ struct PiSessionsFetcher {
         }
     }
 
+    private static func parseTelemetryDate(_ value: Any?) -> Date? {
+        self.parseISODate(value) ?? self.parseMessageTimestamp(value)
+    }
+
     private static func normalizedString(_ value: Any?) -> String? {
         guard let string = value as? String else { return nil }
         let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -229,6 +428,30 @@ struct PiSessionsFetcher {
         default:
             nil
         }
+    }
+
+    private static func numericInt(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber, !Self.isBoolean(number) else { return nil }
+        let raw = number.doubleValue
+        guard raw.isFinite, raw.rounded() == raw else { return nil }
+        return number.intValue
+    }
+
+    private static func nonNegativeInt(_ value: Any?) -> Int? {
+        guard let number = Self.numericInt(value), number >= 0 else { return nil }
+        return number
+    }
+
+    private static func nonNegativeDouble(_ value: Any?) -> Double? {
+        guard let number = value as? NSNumber, !Self.isBoolean(number) else { return nil }
+        let raw = number.doubleValue
+        guard raw.isFinite, raw >= 0 else { return nil }
+        return raw
+    }
+
+    private static func isBoolean(_ number: NSNumber) -> Bool {
+        let type = String(cString: number.objCType)
+        return type == "c" || type == "B"
     }
 
     private static func double(_ value: Any?) -> Double? {

@@ -148,7 +148,8 @@ Menu settings:
 
 Notes:
 
-- Pi totals are based on assistant message `usage.cost.total` values saved in session JSONL files.
+- Pi totals are based on assistant message `usage.cost.total` values saved in session JSONL files, plus completed subagent `provider_call` records from sibling `telemetry/events.jsonl` (by default `~/.pi/agent/telemetry/events.jsonl`) when the sessions directory uses the standard `.../sessions` layout.
+- Main telemetry calls are excluded because they are already represented by session rows; malformed or unavailable telemetry is ignored.
 - A managed Codex account handed off to Pi is also the source used for the app's Codex usage refresh; it is not read from the inactive managed home.
 - Fork dedupe avoids double-counting copied history in forked session files by ignoring entries older than the fork session header timestamp.
 - If a model/provider had missing pricing metadata when a session was recorded, some rows may appear as zero-cost.
