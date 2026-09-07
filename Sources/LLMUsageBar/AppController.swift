@@ -480,15 +480,34 @@ final class AppController: NSObject, NSApplicationDelegate {
             return
         }
 
-        let today = PiUsageAggregation.summary(rows: pi.rows, window: .today)
-        let lastSevenDays = PiUsageAggregation.summary(rows: pi.rows, window: .lastSevenDays)
-        let lastThirtyDays = PiUsageAggregation.summary(rows: pi.rows, window: .lastThirtyDays)
+        let now = Date()
+        let calendar = Calendar.current
+        let today = PiUsageAggregation.summary(rows: pi.rows, window: .today, now: now, calendar: calendar)
+        let lastSevenDays = PiUsageAggregation.summary(rows: pi.rows, window: .lastSevenDays, now: now, calendar: calendar)
+        let lastThirtyDays = PiUsageAggregation.summary(rows: pi.rows, window: .lastThirtyDays, now: now, calendar: calendar)
+        let lastNinetyDays = PiUsageAggregation.summary(rows: pi.rows, window: .lastNinetyDays, now: now, calendar: calendar)
 
         menu.addItem(self.disabledItem("All-time: \(Formatting.compactNumber(pi.sessionCount)) files • \(Formatting.compactNumber(pi.rows.count)) assistant responses"))
         menu.addItem(self.disabledItem("Dir: \(Formatting.abbreviatedPath(pi.sessionsDirectory))"))
-        menu.addItem(self.disabledItem("Today: \(self.piSummaryText(today))"))
-        menu.addItem(self.disabledItem("Last 7d: \(self.piSummaryText(lastSevenDays))"))
-        menu.addItem(self.disabledItem("Last 30d: \(self.piSummaryText(lastThirtyDays))"))
+        let summaryChartItem = NSMenuItem(title: "Pi usage summaries and token chart", action: nil, keyEquivalent: "")
+        summaryChartItem.isEnabled = false
+        summaryChartItem.view = PiUsageSummaryChartView(
+            summaries: [
+                PiUsageSummaryChartView.Summary(
+                    title: PiUsageWindow.today.title,
+                    detail: self.piSummaryText(today)),
+                PiUsageSummaryChartView.Summary(
+                    title: PiUsageWindow.lastSevenDays.title,
+                    detail: self.piSummaryText(lastSevenDays)),
+                PiUsageSummaryChartView.Summary(
+                    title: PiUsageWindow.lastThirtyDays.title,
+                    detail: self.piSummaryText(lastThirtyDays)),
+                PiUsageSummaryChartView.Summary(
+                    title: PiUsageWindow.lastNinetyDays.title,
+                    detail: self.piSummaryText(lastNinetyDays)),
+            ],
+            buckets: PiUsageAggregation.dailyTokenUsage(rows: pi.rows, now: now, calendar: calendar))
+        menu.addItem(summaryChartItem)
 
         menu.addItem(.separator())
 

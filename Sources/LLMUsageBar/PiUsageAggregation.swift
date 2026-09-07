@@ -4,17 +4,26 @@ enum PiUsageWindow {
     case today
     case lastSevenDays
     case lastThirtyDays
+    case lastNinetyDays
 
     var title: String {
         switch self {
         case .today: "Today"
         case .lastSevenDays: "Last 7d"
         case .lastThirtyDays: "Last 30d"
+        case .lastNinetyDays: "Last 90d"
         }
     }
 }
 
+struct PiDailyUsageBucket: Sendable, Equatable {
+    let day: Date
+    let totalTokens: Int
+}
+
 enum PiUsageAggregation {
+    static let dailyChartDayCount = 90
+
     static func summary(
         rows: [PiUsageRow],
         window: PiUsageWindow,
@@ -26,11 +35,47 @@ enum PiUsageAggregation {
         return PiSummary(
             requestCount: filtered.count,
             totalCostUSD: filtered.reduce(0) { $0 + $1.costUSD },
-            totalInputTokens: filtered.reduce(0) { $0 + $1.inputTokens },
-            totalOutputTokens: filtered.reduce(0) { $0 + $1.outputTokens },
-            totalCacheReadTokens: filtered.reduce(0) { $0 + $1.cacheReadTokens },
-            totalCacheWriteTokens: filtered.reduce(0) { $0 + $1.cacheWriteTokens }
+            totalInputTokens: self.tokenSum(filtered, keyPath: \.inputTokens),
+            totalOutputTokens: self.tokenSum(filtered, keyPath: \.outputTokens),
+            totalCacheReadTokens: self.tokenSum(filtered, keyPath: \.cacheReadTokens),
+            totalCacheWriteTokens: self.tokenSum(filtered, keyPath: \.cacheWriteTokens)
         )
+    }
+
+    static func dailyTokenUsage(
+        rows: [PiUsageRow],
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> [PiDailyUsageBucket] {
+        let today = calendar.startOfDay(for: now)
+        guard let firstDay = calendar.date(
+            byAdding: .day,
+            value: -(self.dailyChartDayCount - 1),
+            to: today)
+        else {
+            return []
+        }
+
+        var totalsByDay: [Date: Int] = [:]
+        for row in rows {
+            guard row.timeCreated <= now else { continue }
+
+            let day = calendar.startOfDay(for: row.timeCreated)
+            guard day >= firstDay, day <= today else { continue }
+
+            let rowTokens = self.tokenCount(for: row)
+            totalsByDay[day] = PiTokenTotals.saturatedNonnegativeSum([totalsByDay[day] ?? 0, rowTokens])
+        }
+
+        var buckets: [PiDailyUsageBucket] = []
+        buckets.reserveCapacity(self.dailyChartDayCount)
+        for offset in 0..<self.dailyChartDayCount {
+            guard let day = calendar.date(byAdding: .day, value: offset, to: firstDay) else {
+                continue
+            }
+            buckets.append(PiDailyUsageBucket(day: day, totalTokens: totalsByDay[day] ?? 0))
+        }
+        return buckets
     }
 
     static func groupByModel(
@@ -119,7 +164,35 @@ enum PiUsageAggregation {
         case .lastThirtyDays:
             let cutoff = now.addingTimeInterval(-(30 * 24 * 60 * 60))
             return date >= cutoff && date <= now
+        case .lastNinetyDays:
+            let today = calendar.startOfDay(for: now)
+            guard let firstDay = calendar.date(
+                byAdding: .day,
+                value: -(self.dailyChartDayCount - 1),
+                to: today)
+            else {
+                return false
+            }
+            return date >= firstDay && date <= now
         }
+    }
+
+    private static func tokenSum(
+        _ rows: [PiUsageRow],
+        keyPath: KeyPath<PiUsageRow, Int>
+    ) -> Int {
+        rows.reduce(0) { total, row in
+            PiTokenTotals.saturatedNonnegativeSum([total, row[keyPath: keyPath]])
+        }
+    }
+
+    private static func tokenCount(for row: PiUsageRow) -> Int {
+        PiTokenTotals.saturatedNonnegativeSum([
+            row.inputTokens,
+            row.outputTokens,
+            row.cacheReadTokens,
+            row.cacheWriteTokens,
+        ])
     }
 
     private static func group(

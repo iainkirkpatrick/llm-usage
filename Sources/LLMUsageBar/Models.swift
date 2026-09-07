@@ -160,6 +160,15 @@ struct PiUsageRow: Sendable {
     let costUSD: Double
 }
 
+enum PiTokenTotals {
+    static func saturatedNonnegativeSum(_ values: [Int]) -> Int {
+        values.reduce(0) { total, value in
+            let (sum, overflow) = total.addingReportingOverflow(max(0, value))
+            return overflow ? Int.max : sum
+        }
+    }
+}
+
 struct PiSummary: Sendable {
     let requestCount: Int
     let totalCostUSD: Double
@@ -169,7 +178,12 @@ struct PiSummary: Sendable {
     let totalCacheWriteTokens: Int
 
     var totalTokens: Int {
-        self.totalInputTokens + self.totalOutputTokens + self.totalCacheReadTokens + self.totalCacheWriteTokens
+        PiTokenTotals.saturatedNonnegativeSum([
+            self.totalInputTokens,
+            self.totalOutputTokens,
+            self.totalCacheReadTokens,
+            self.totalCacheWriteTokens,
+        ])
     }
 }
 
