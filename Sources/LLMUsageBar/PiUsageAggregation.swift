@@ -33,8 +33,8 @@ enum PiUsageAggregation {
         let filtered = self.filteredRows(rows: rows, window: window, now: now, calendar: calendar)
 
         return PiSummary(
-            requestCount: filtered.count,
-            totalCostUSD: filtered.reduce(0) { $0 + $1.costUSD },
+            requestCount: self.requestSum(filtered),
+            totalCostUSD: PiTokenTotals.saturatedNonnegativeCostSum(filtered.map(\.costUSD)),
             totalInputTokens: self.tokenSum(filtered, keyPath: \.inputTokens),
             totalOutputTokens: self.tokenSum(filtered, keyPath: \.outputTokens),
             totalCacheReadTokens: self.tokenSum(filtered, keyPath: \.cacheReadTokens),
@@ -177,6 +177,16 @@ enum PiUsageAggregation {
         }
     }
 
+    static func requestCount(rows: [PiUsageRow]) -> Int {
+        self.requestSum(rows)
+    }
+
+    private static func requestSum(_ rows: [PiUsageRow]) -> Int {
+        rows.reduce(0) { total, row in
+            PiTokenTotals.saturatedNonnegativeSum([total, row.requestCount])
+        }
+    }
+
     private static func tokenSum(
         _ rows: [PiUsageRow],
         keyPath: KeyPath<PiUsageRow, Int>
@@ -209,12 +219,12 @@ enum PiUsageAggregation {
         for row in filtered {
             let label = key(row)
             var value = buckets[label] ?? (0, 0, 0, 0, 0, 0)
-            value.count += 1
-            value.cost += row.costUSD
-            value.input += row.inputTokens
-            value.output += row.outputTokens
-            value.cacheRead += row.cacheReadTokens
-            value.cacheWrite += row.cacheWriteTokens
+            value.count = PiTokenTotals.saturatedNonnegativeSum([value.count, row.requestCount])
+            value.cost = PiTokenTotals.saturatedNonnegativeCostSum([value.cost, row.costUSD])
+            value.input = PiTokenTotals.saturatedNonnegativeSum([value.input, row.inputTokens])
+            value.output = PiTokenTotals.saturatedNonnegativeSum([value.output, row.outputTokens])
+            value.cacheRead = PiTokenTotals.saturatedNonnegativeSum([value.cacheRead, row.cacheReadTokens])
+            value.cacheWrite = PiTokenTotals.saturatedNonnegativeSum([value.cacheWrite, row.cacheWriteTokens])
             buckets[label] = value
         }
 

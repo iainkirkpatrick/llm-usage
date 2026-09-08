@@ -149,8 +149,8 @@ Menu settings:
 Notes:
 
 - The Pi menu shows usage totals for today, the last 7d, the last 30d, and the last 90d, followed by a compact 90-day daily token bar chart. The chart uses local calendar days, includes zero-usage days, and totals input, output, cache-read, and cache-write tokens. Hover a day slot while the menu is open to highlight it and inspect its exact local date and locale-formatted token count, including zero-token days.
-- Pi totals are based on assistant message `usage.cost.total` values saved in session JSONL files, plus completed subagent `provider_call` records from sibling `telemetry/events.jsonl` (by default `~/.pi/agent/telemetry/events.jsonl`) when the sessions directory uses the standard `.../sessions` layout.
-- Main telemetry calls are excluded because they are already represented by session rows; malformed or unavailable telemetry is ignored.
+- Pi totals are based on assistant message usage and completed subagent summaries persisted in the parent session JSONL. Subagent summaries are the `toolResult` records for the `subagent` tool; each valid result contributes its saved model usage and is assigned to the tool-result/completion timestamp.
+- Incomplete subagent runs or results without usable usage are omitted. Pi does not read `telemetry/events.jsonl`; the persisted parent-session summary is the canonical subagent source and avoids counting a completed run twice.
 - A managed Codex account handed off to Pi is also the source used for the app's Codex usage refresh; it is not read from the inactive managed home.
 - Fork dedupe avoids double-counting copied history in forked session files by ignoring entries older than the fork session header timestamp.
 - If a model/provider had missing pricing metadata when a session was recorded, some rows may appear as zero-cost.

@@ -487,7 +487,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         let lastThirtyDays = PiUsageAggregation.summary(rows: pi.rows, window: .lastThirtyDays, now: now, calendar: calendar)
         let lastNinetyDays = PiUsageAggregation.summary(rows: pi.rows, window: .lastNinetyDays, now: now, calendar: calendar)
 
-        menu.addItem(self.disabledItem("All-time: \(Formatting.compactNumber(pi.sessionCount)) files • \(Formatting.compactNumber(pi.rows.count)) assistant responses"))
+        menu.addItem(self.disabledItem("All-time: \(Formatting.compactNumber(pi.sessionCount)) files • \(Formatting.compactNumber(PiUsageAggregation.requestCount(rows: pi.rows))) requests"))
         menu.addItem(self.disabledItem("Dir: \(Formatting.abbreviatedPath(pi.sessionsDirectory))"))
         let summaryChartItem = NSMenuItem(title: "Pi usage summaries and token chart", action: nil, keyEquivalent: "")
         summaryChartItem.isEnabled = false

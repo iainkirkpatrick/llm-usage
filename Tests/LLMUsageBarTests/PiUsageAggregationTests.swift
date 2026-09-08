@@ -90,6 +90,29 @@ final class PiUsageAggregationTests: XCTestCase {
         XCTAssertEqual(Formatting.tokens(summary.totalTokens), Formatting.tokens(Int.max))
     }
 
+    func testSummaryAndGroupsUsePerRowRequestContributionsWithSaturation() throws {
+        let calendar = self.calendar(timeZoneSecondsFromGMT: 0)
+        let now = try self.date("2026-09-07T12:00:00Z")
+        let rows = [
+            self.row(at: now, input: 1, output: 2, requestCount: 1),
+            self.row(at: now, input: 3, output: 4, requestCount: 3),
+            self.row(at: now, input: Int.max, output: 0, requestCount: Int.max),
+        ]
+
+        let summary = PiUsageAggregation.summary(rows: rows, window: .today, now: now, calendar: calendar)
+        let groups = PiUsageAggregation.groupByModel(rows: rows, window: .today, now: now, calendar: calendar)
+
+        XCTAssertEqual(summary.requestCount, Int.max)
+        XCTAssertEqual(summary.totalInputTokens, Int.max)
+        XCTAssertEqual(summary.totalOutputTokens, 6)
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(groups[0].requestCount, Int.max)
+        XCTAssertEqual(groups[0].totalInputTokens, Int.max)
+        XCTAssertEqual(groups[0].totalOutputTokens, 6)
+        XCTAssertEqual(groups[0].totalTokens, Int.max)
+        XCTAssertEqual(PiUsageAggregation.requestCount(rows: rows), Int.max)
+    }
+
     func testDailyTokenUsageReturnsNinetyBucketsWithZeroDaysAndAllTokenComponents() throws {
         let calendar = self.calendar(timeZoneSecondsFromGMT: 0)
         let now = try self.date("2026-09-07T12:00:00Z")
@@ -172,7 +195,8 @@ final class PiUsageAggregationTests: XCTestCase {
         output: Int = 1,
         cacheRead: Int = 0,
         cacheWrite: Int = 0,
-        totalTokens: Int? = nil
+        totalTokens: Int? = nil,
+        requestCount: Int = 1
     ) -> PiUsageRow {
         PiUsageRow(
             timeCreated: date,
@@ -186,7 +210,8 @@ final class PiUsageAggregationTests: XCTestCase {
             cacheReadTokens: cacheRead,
             cacheWriteTokens: cacheWrite,
             totalTokens: totalTokens ?? input + output + cacheRead + cacheWrite,
-            costUSD: 1)
+            costUSD: 1,
+            requestCount: requestCount)
     }
 
     private func calendar(timeZoneSecondsFromGMT: Int) -> Calendar {

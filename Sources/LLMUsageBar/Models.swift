@@ -158,6 +158,41 @@ struct PiUsageRow: Sendable {
     let cacheWriteTokens: Int
     let totalTokens: Int
     let costUSD: Double
+    /// The number of requests represented by this row. Main assistant messages contribute one;
+    /// a completed subagent summary contributes its number of model turns.
+    let requestCount: Int
+
+    init(
+        timeCreated: Date,
+        sessionFile: String,
+        sessionID: String?,
+        cwd: String?,
+        provider: String?,
+        model: String?,
+        inputTokens: Int,
+        outputTokens: Int,
+        cacheReadTokens: Int,
+        cacheWriteTokens: Int,
+        totalTokens: Int,
+        costUSD: Double,
+        requestCount: Int = 1
+    ) {
+        self.timeCreated = timeCreated
+        self.sessionFile = sessionFile
+        self.sessionID = sessionID
+        self.cwd = cwd
+        self.provider = provider
+        self.model = model
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cacheReadTokens = cacheReadTokens
+        self.cacheWriteTokens = cacheWriteTokens
+        self.totalTokens = totalTokens
+        self.costUSD = costUSD
+        self.requestCount = requestCount
+    }
+
+    var requestCountContribution: Int { self.requestCount }
 }
 
 enum PiTokenTotals {
@@ -165,6 +200,15 @@ enum PiTokenTotals {
         values.reduce(0) { total, value in
             let (sum, overflow) = total.addingReportingOverflow(max(0, value))
             return overflow ? Int.max : sum
+        }
+    }
+
+    static func saturatedNonnegativeCostSum(_ values: [Double]) -> Double {
+        values.reduce(0) { total, value in
+            guard value.isFinite, value >= 0 else { return total }
+            let maximum = Double.greatestFiniteMagnitude
+            guard total <= maximum - value else { return maximum }
+            return total + value
         }
     }
 }
@@ -197,7 +241,12 @@ struct PiGroupSummary: Sendable {
     let totalCacheWriteTokens: Int
 
     var totalTokens: Int {
-        self.totalInputTokens + self.totalOutputTokens + self.totalCacheReadTokens + self.totalCacheWriteTokens
+        PiTokenTotals.saturatedNonnegativeSum([
+            self.totalInputTokens,
+            self.totalOutputTokens,
+            self.totalCacheReadTokens,
+            self.totalCacheWriteTokens,
+        ])
     }
 }
 
