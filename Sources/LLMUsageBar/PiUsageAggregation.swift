@@ -16,13 +16,23 @@ enum PiUsageWindow {
     }
 }
 
+/// Compatibility model for callers that only need the original fixed daily chart.
+/// New chart code should use `PiChartBucket` and `PiChartDataset`.
 struct PiDailyUsageBucket: Sendable, Equatable {
     let day: Date
     let totalTokens: Int
 }
 
 enum PiUsageAggregation {
-    static let dailyChartDayCount = 90
+    /// The fixed summary-card/chart window remains 90 local calendar days.
+    static let ninetyDayChartDayCount = 90
+    /// Kept for source compatibility with the original daily-chart API.
+    static let dailyChartDayCount = Self.ninetyDayChartDayCount
+
+    /// All-time history stays weekly through 104 buckets (roughly two years at
+    /// seven days per bucket). Older history switches to calendar-month buckets
+    /// so the menu chart does not become a dense strip of unreadable bars.
+    static let allWeeklyBucketThreshold = 104
 
     static func summary(
         rows: [PiUsageRow],
@@ -42,40 +52,110 @@ enum PiUsageAggregation {
         )
     }
 
+    /// Builds every selectable chart range from one immutable row snapshot.
+    /// Dates in the returned buckets are local start-of-day values and their end
+    /// dates are inclusive. Future rows are excluded before any bucket is made.
+    static func chartDatasets(
+        rows: [PiUsageRow],
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> [PiChartRange: PiChartDataset] {
+        let today = calendar.startOfDay(for: now)
+        let eligibleRows = rows.filter { $0.timeCreated <= now }
+        let totalsByDay = self.tokenTotalsByDay(
+            rows: eligibleRows,
+            calendar: calendar)
+
+        let ninetyStart = calendar.startOfDay(for: calendar.date(
+            byAdding: .day,
+            value: -(Self.ninetyDayChartDayCount - 1),
+            to: today) ?? today)
+        let sixMonthStart = calendar.startOfDay(for: calendar.date(
+            byAdding: .month,
+            value: -6,
+            to: today) ?? today)
+        let oneYearStart = calendar.startOfDay(for: calendar.date(
+            byAdding: .year,
+            value: -1,
+            to: today) ?? today)
+
+        var datasets: [PiChartRange: PiChartDataset] = [
+            .ninetyDays: PiChartDataset(
+                range: .ninetyDays,
+                unitLabel: "day",
+                buckets: self.dailyBuckets(
+                    from: ninetyStart,
+                    through: today,
+                    totalsByDay: totalsByDay,
+                    calendar: calendar)),
+            .sixMonths: PiChartDataset(
+                range: .sixMonths,
+                unitLabel: "day",
+                buckets: self.dailyBuckets(
+                    from: sixMonthStart,
+                    through: today,
+                    totalsByDay: totalsByDay,
+                    calendar: calendar)),
+            .oneYear: PiChartDataset(
+                range: .oneYear,
+                unitLabel: "week",
+                buckets: self.weeklyBuckets(
+                    from: oneYearStart,
+                    through: today,
+                    totalsByDay: totalsByDay,
+                    calendar: calendar)),
+        ]
+
+        guard let earliestEligibleDay = eligibleRows
+            .map({ calendar.startOfDay(for: $0.timeCreated) })
+            .filter({ $0 <= today })
+            .min()
+        else {
+            // There is no meaningful all-time start without an eligible row. The
+            // fixed ranges still contain zero-filled buckets; All is empty.
+            datasets[.all] = PiChartDataset(
+                range: .all,
+                unitLabel: "week",
+                buckets: [])
+            return datasets
+        }
+
+        let weeklyCount = self.weeklyBucketCount(
+            from: earliestEligibleDay,
+            through: today,
+            calendar: calendar)
+        if weeklyCount <= Self.allWeeklyBucketThreshold {
+            datasets[.all] = PiChartDataset(
+                range: .all,
+                unitLabel: "week",
+                buckets: self.weeklyBuckets(
+                    from: earliestEligibleDay,
+                    through: today,
+                    totalsByDay: totalsByDay,
+                    calendar: calendar))
+        } else {
+            datasets[.all] = PiChartDataset(
+                range: .all,
+                unitLabel: "month",
+                buckets: self.monthlyBuckets(
+                    from: earliestEligibleDay,
+                    through: today,
+                    totalsByDay: totalsByDay,
+                    calendar: calendar))
+        }
+
+        return datasets
+    }
+
+    /// Compatibility wrapper for the original 90-day daily chart API.
     static func dailyTokenUsage(
         rows: [PiUsageRow],
         now: Date = Date(),
         calendar: Calendar = .current
     ) -> [PiDailyUsageBucket] {
-        let today = calendar.startOfDay(for: now)
-        guard let firstDay = calendar.date(
-            byAdding: .day,
-            value: -(self.dailyChartDayCount - 1),
-            to: today)
-        else {
-            return []
-        }
-
-        var totalsByDay: [Date: Int] = [:]
-        for row in rows {
-            guard row.timeCreated <= now else { continue }
-
-            let day = calendar.startOfDay(for: row.timeCreated)
-            guard day >= firstDay, day <= today else { continue }
-
-            let rowTokens = self.tokenCount(for: row)
-            totalsByDay[day] = PiTokenTotals.saturatedNonnegativeSum([totalsByDay[day] ?? 0, rowTokens])
-        }
-
-        var buckets: [PiDailyUsageBucket] = []
-        buckets.reserveCapacity(self.dailyChartDayCount)
-        for offset in 0..<self.dailyChartDayCount {
-            guard let day = calendar.date(byAdding: .day, value: offset, to: firstDay) else {
-                continue
-            }
-            buckets.append(PiDailyUsageBucket(day: day, totalTokens: totalsByDay[day] ?? 0))
-        }
-        return buckets
+        self.chartDatasets(rows: rows, now: now, calendar: calendar)[.ninetyDays]?.buckets.map {
+            PiDailyUsageBucket(day: $0.startDate, totalTokens: $0.totalTokens)
+        } ?? []
     }
 
     static func groupByModel(
@@ -138,6 +218,189 @@ enum PiUsageAggregation {
         )
     }
 
+    private static func tokenTotalsByDay(
+        rows: [PiUsageRow],
+        calendar: Calendar
+    ) -> [Date: Int] {
+        var totalsByDay: [Date: Int] = [:]
+        for row in rows {
+            let day = calendar.startOfDay(for: row.timeCreated)
+            let rowTokens = self.tokenCount(for: row)
+            totalsByDay[day] = PiTokenTotals.saturatedNonnegativeSum([
+                totalsByDay[day] ?? 0,
+                rowTokens,
+            ])
+        }
+        return totalsByDay
+    }
+
+    private static func dailyBuckets(
+        from startDate: Date,
+        through endDate: Date,
+        totalsByDay: [Date: Int],
+        calendar: Calendar
+    ) -> [PiChartBucket] {
+        guard startDate <= endDate else { return [] }
+
+        var buckets: [PiChartBucket] = []
+        var day = startDate
+        while day <= endDate {
+            buckets.append(PiChartBucket(
+                startDate: day,
+                endDate: day,
+                totalTokens: max(0, totalsByDay[day] ?? 0)))
+
+            guard let nextDay = calendar.date(byAdding: .day, value: 1, to: day),
+                  nextDay > day
+            else {
+                break
+            }
+            day = nextDay
+        }
+        return buckets
+    }
+
+    private static func weeklyBuckets(
+        from startDate: Date,
+        through endDate: Date,
+        totalsByDay: [Date: Int],
+        calendar: Calendar
+    ) -> [PiChartBucket] {
+        self.fixedWidthBuckets(
+            from: startDate,
+            through: endDate,
+            dayWidth: 7,
+            totalsByDay: totalsByDay,
+            calendar: calendar)
+    }
+
+    private static func fixedWidthBuckets(
+        from startDate: Date,
+        through endDate: Date,
+        dayWidth: Int,
+        totalsByDay: [Date: Int],
+        calendar: Calendar
+    ) -> [PiChartBucket] {
+        guard startDate <= endDate, dayWidth > 0 else { return [] }
+
+        var buckets: [PiChartBucket] = []
+        var bucketStart = startDate
+        while bucketStart <= endDate {
+            let candidateEnd = calendar.date(
+                byAdding: .day,
+                value: dayWidth - 1,
+                to: bucketStart) ?? bucketStart
+            let bucketEnd = min(candidateEnd, endDate)
+            buckets.append(PiChartBucket(
+                startDate: bucketStart,
+                endDate: bucketEnd,
+                totalTokens: self.tokenTotal(
+                    from: bucketStart,
+                    through: bucketEnd,
+                    totalsByDay: totalsByDay,
+                    calendar: calendar)))
+
+            guard let nextStart = calendar.date(
+                byAdding: .day,
+                value: dayWidth,
+                to: bucketStart),
+                  nextStart > bucketStart
+            else {
+                break
+            }
+            bucketStart = nextStart
+        }
+        return buckets
+    }
+
+    private static func monthlyBuckets(
+        from earliestDay: Date,
+        through today: Date,
+        totalsByDay: [Date: Int],
+        calendar: Calendar
+    ) -> [PiChartBucket] {
+        guard earliestDay <= today else { return [] }
+
+        var monthComponents = calendar.dateComponents([.year, .month], from: earliestDay)
+        monthComponents.day = 1
+        guard let firstMonth = calendar.date(from: monthComponents) else { return [] }
+        var monthStart = calendar.startOfDay(for: firstMonth)
+
+        var buckets: [PiChartBucket] = []
+        while monthStart <= today {
+            guard let nextMonthDate = calendar.date(byAdding: .month, value: 1, to: monthStart) else {
+                break
+            }
+            let nextMonth = calendar.startOfDay(for: nextMonthDate)
+            guard nextMonth > monthStart else { break }
+            let lastDayDate = calendar.date(byAdding: .day, value: -1, to: nextMonth) ?? monthStart
+            let lastDayOfMonth = calendar.startOfDay(for: lastDayDate)
+            let bucketStart = max(earliestDay, monthStart)
+            let bucketEnd = min(today, lastDayOfMonth)
+            if bucketStart <= bucketEnd {
+                buckets.append(PiChartBucket(
+                    startDate: bucketStart,
+                    endDate: bucketEnd,
+                    totalTokens: self.tokenTotal(
+                        from: bucketStart,
+                        through: bucketEnd,
+                        totalsByDay: totalsByDay,
+                        calendar: calendar)))
+            }
+            monthStart = nextMonth
+        }
+        return buckets
+    }
+
+    private static func weeklyBucketCount(
+        from startDate: Date,
+        through endDate: Date,
+        calendar: Calendar
+    ) -> Int {
+        guard startDate <= endDate else { return 0 }
+
+        var count = 0
+        var bucketStart = startDate
+        while bucketStart <= endDate {
+            count += 1
+            if count > Self.allWeeklyBucketThreshold {
+                return count
+            }
+            guard let nextStart = calendar.date(byAdding: .day, value: 7, to: bucketStart),
+                  nextStart > bucketStart
+            else {
+                break
+            }
+            bucketStart = nextStart
+        }
+        return count
+    }
+
+    private static func tokenTotal(
+        from startDate: Date,
+        through endDate: Date,
+        totalsByDay: [Date: Int],
+        calendar: Calendar
+    ) -> Int {
+        guard startDate <= endDate else { return 0 }
+
+        var total = 0
+        var day = startDate
+        while day <= endDate {
+            total = PiTokenTotals.saturatedNonnegativeSum([
+                total,
+                totalsByDay[day] ?? 0,
+            ])
+            guard let nextDay = calendar.date(byAdding: .day, value: 1, to: day),
+                  nextDay > day
+            else {
+                break
+            }
+            day = nextDay
+        }
+        return total
+    }
+
     private static func filteredRows(
         rows: [PiUsageRow],
         window: PiUsageWindow,
@@ -168,7 +431,7 @@ enum PiUsageAggregation {
             let today = calendar.startOfDay(for: now)
             guard let firstDay = calendar.date(
                 byAdding: .day,
-                value: -(self.dailyChartDayCount - 1),
+                value: -(Self.ninetyDayChartDayCount - 1),
                 to: today)
             else {
                 return false

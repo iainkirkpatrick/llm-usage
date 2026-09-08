@@ -489,8 +489,14 @@ final class AppController: NSObject, NSApplicationDelegate {
 
         menu.addItem(self.disabledItem("All-time: \(Formatting.compactNumber(pi.sessionCount)) files • \(Formatting.compactNumber(PiUsageAggregation.requestCount(rows: pi.rows))) requests"))
         menu.addItem(self.disabledItem("Dir: \(Formatting.abbreviatedPath(pi.sessionsDirectory))"))
+        let chartDatasets = PiUsageAggregation.chartDatasets(
+            rows: pi.rows,
+            now: now,
+            calendar: calendar)
         let summaryChartItem = NSMenuItem(title: "Pi usage summaries and token chart", action: nil, keyEquivalent: "")
-        summaryChartItem.isEnabled = false
+        // The embedded segmented control handles its own click, so this menu
+        // item must remain enabled while the menu is tracking.
+        summaryChartItem.isEnabled = true
         summaryChartItem.view = PiUsageSummaryChartView(
             summaries: [
                 PiUsageSummaryChartView.Summary(
@@ -506,26 +512,39 @@ final class AppController: NSObject, NSApplicationDelegate {
                     title: PiUsageWindow.lastNinetyDays.title,
                     detail: self.piSummaryText(lastNinetyDays)),
             ],
-            buckets: PiUsageAggregation.dailyTokenUsage(rows: pi.rows, now: now, calendar: calendar))
+            datasets: chartDatasets,
+            initialRange: .ninetyDays)
         menu.addItem(summaryChartItem)
 
         menu.addItem(.separator())
 
-        let topModels = PiUsageAggregation.groupByModel(rows: pi.rows, window: .lastSevenDays)
+        let topModels = PiUsageAggregation.groupByModel(
+            rows: pi.rows,
+            window: .lastSevenDays,
+            now: now,
+            calendar: calendar)
         menu.addItem(self.groupSubmenuItem(
             title: "Top models (7d)",
             groups: topModels,
             transformLabel: { $0 }
         ))
 
-        let topProviders = PiUsageAggregation.groupByProvider(rows: pi.rows, window: .lastThirtyDays)
+        let topProviders = PiUsageAggregation.groupByProvider(
+            rows: pi.rows,
+            window: .lastThirtyDays,
+            now: now,
+            calendar: calendar)
         menu.addItem(self.groupSubmenuItem(
             title: "Top providers (30d)",
             groups: topProviders,
             transformLabel: { $0 }
         ))
 
-        let topProjects = PiUsageAggregation.groupByProject(rows: pi.rows, window: .lastThirtyDays)
+        let topProjects = PiUsageAggregation.groupByProject(
+            rows: pi.rows,
+            window: .lastThirtyDays,
+            now: now,
+            calendar: calendar)
         menu.addItem(self.groupSubmenuItem(
             title: "Top projects (30d)",
             groups: topProjects,

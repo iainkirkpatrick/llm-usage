@@ -4,7 +4,7 @@ Small macOS menu bar app to track:
 
 - **Codex** usage (session + weekly + credits + saved rate-limit resets)
 - **OpenCode Go** usage (5h/weekly/monthly + model usage history for GLM-5, Kimi K2.5, MiniMax M2.5)
-- **Pi** local session usage (today / last 7d / last 30d / last 90d, a 90-day daily token chart, and model/provider/project summaries)
+- **Pi** local session usage (today / last 7d / last 30d / last 90d, a selectable 90d/6m/1y/All token chart, and model/provider/project summaries)
 
 ## Build & Run
 
@@ -148,7 +148,7 @@ Menu settings:
 
 Notes:
 
-- The Pi menu shows usage totals for today, the last 7d, the last 30d, and the last 90d, followed by a compact 90-day daily token bar chart. The chart uses local calendar days, includes zero-usage days, and totals input, output, cache-read, and cache-write tokens. Hover a day slot while the menu is open to highlight it and inspect its exact local date and locale-formatted token count, including zero-token days.
+- The Pi menu keeps four summary cards for today, the last 7d, the last 30d, and the last 90d, followed by a compact range-selectable token bar chart. Its 90d/6m/1y/All selector is interactive while the menu stays open. Choose 90d or 6m for local-calendar daily buckets, 1y for contiguous local-calendar seven-day buckets, or All for weekly buckets through 104 buckets (roughly two years) and calendar-month buckets for older history (the first/last month can be a partial range so the chart starts at the earliest eligible local day and ends today). Fixed-range charts and All use zero-filled buckets, exclude rows newer than the refresh time, and saturate negative/overflowing token sums. Hover a bucket while the menu is open to highlight it and inspect its exact local date (daily) or inclusive date range (weekly/monthly) and locale-formatted token count, including zero-token buckets.
 - Pi totals are based on assistant message usage and completed subagent summaries persisted in the parent session JSONL. Subagent summaries are the `toolResult` records for the `subagent` tool; each valid result contributes its saved model usage and is assigned to the tool-result/completion timestamp.
 - Incomplete subagent runs or results without usable usage are omitted. Pi does not read `telemetry/events.jsonl`; the persisted parent-session summary is the canonical subagent source and avoids counting a completed run twice.
 - A managed Codex account handed off to Pi is also the source used for the app's Codex usage refresh; it is not read from the inactive managed home.

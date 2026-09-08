@@ -15,41 +15,98 @@ final class PiUsageSummaryChartView: NSView {
     private static let summaryRowHeight: CGFloat = 29
     private static let cellHorizontalInset: CGFloat = 9
     private static let summaryHeight: CGFloat = 58
-    private static let chartHeight: CGFloat = 106
+    private static let chartHeight: CGFloat = 126
     private static let sectionGap: CGFloat = 6
     private static let topInset: CGFloat = 10
-    private static let viewHeight: CGFloat = 180
-    private static let hoverAccessibilityHelp = "Move the pointer over a day in the chart to inspect its exact local date and token count."
+    private static let viewHeight: CGFloat = 200
+    private static let headerHeight: CGFloat = 20
+    private static let hoverAccessibilityHelp = "Move the pointer over a chart bucket to inspect its exact local date or date range and token count."
 
     private let summaries: [Summary]
-    private let buckets: [PiDailyUsageBucket]
-    private let peakTokens: Int
+    private let datasets: [PiChartRange: PiChartDataset]
+    private let chartRanges: [PiChartRange]
+    private let rangeControl: NSSegmentedControl
     private let viewSize: NSSize
-    private let accessibilitySummary: String
     private var trackingArea: NSTrackingArea?
+    private var rangeControlTrackingArea: NSTrackingArea?
     private var hoveredBucketIndex: Int?
+    private var activeRange: PiChartRange
 
-    init(summaries: [Summary], buckets: [PiDailyUsageBucket]) {
+    private var selectedDataset: PiChartDataset {
+        self.datasets[self.activeRange]
+            ?? PiChartDataset(range: self.activeRange, unitLabel: "day", buckets: [])
+    }
+
+    init(
+        summaries: [Summary],
+        datasets: [PiChartRange: PiChartDataset],
+        initialRange: PiChartRange = .ninetyDays
+    ) {
         let viewSummaries = Array(summaries.prefix(4))
+        let ranges = PiChartRange.allCases.filter { datasets[$0] != nil }
+        let selected = ranges.contains(initialRange) ? initialRange : (ranges.first ?? .ninetyDays)
+        let control = NSSegmentedControl(frame: .zero)
+        control.segmentCount = ranges.count
+        control.trackingMode = .selectOne
+        control.segmentStyle = .rounded
+        control.segmentDistribution = .fillEqually
+        control.controlSize = .small
+        control.font = NSFont.systemFont(ofSize: 10, weight: .medium)
+        control.selectedSegmentBezelColor = .controlAccentColor
+        for (index, range) in ranges.enumerated() {
+            control.setLabel(range.title, forSegment: index)
+            control.setToolTip("Show \(range.title) Pi token usage", forSegment: index)
+        }
+
         let size = NSSize(
             width: Self.width(for: viewSummaries),
             height: Self.viewHeight)
 
         self.summaries = viewSummaries
-        self.buckets = buckets
-        self.peakTokens = buckets.map { max(0, $0.totalTokens) }.max() ?? 0
+        self.datasets = datasets
+        self.chartRanges = ranges
+        self.rangeControl = control
+        self.activeRange = selected
         self.viewSize = size
-        self.accessibilitySummary = Self.makeAccessibilitySummary(
-            summaries: viewSummaries,
-            buckets: buckets)
         super.init(frame: NSRect(origin: .zero, size: size))
+
+        control.target = self
+        control.action = #selector(self.rangeControlChanged(_:))
+        if let selectedIndex = ranges.firstIndex(of: selected) {
+            control.selectedSegment = selectedIndex
+        }
+        control.setAccessibilityLabel("Pi chart range")
+        control.setAccessibilityHelp("Choose 90d, 6m, 1y, or All for the Pi token chart.")
+        control.toolTip = "Choose a Pi token chart range"
+        self.addSubview(control)
+        self.rangeControl.frame = self.rangeSelectorRect(
+            in: self.plotRect(in: self.chartRect()))
+        self.updateRangeControlTrackingArea()
 
         self.setAccessibilityElement(true)
         self.setAccessibilityRole(.group)
-        self.setAccessibilityLabel("Pi usage summaries and 90-day token usage chart")
-        self.setAccessibilityValue(self.accessibilitySummary)
+        self.setAccessibilityLabel("Pi usage summaries and \(selected.title) token usage chart")
+        self.setAccessibilityValue(self.makeAccessibilitySummary())
         self.setAccessibilityHelp(Self.hoverAccessibilityHelp)
-        self.toolTip = self.accessibilitySummary
+        self.toolTip = self.makeAccessibilitySummary()
+    }
+
+    /// Compatibility initializer for callers that still provide only the
+    /// original fixed daily buckets.
+    convenience init(summaries: [Summary], buckets: [PiDailyUsageBucket]) {
+        self.init(
+            summaries: summaries,
+            datasets: [
+                .ninetyDays: PiChartDataset(
+                    range: .ninetyDays,
+                    unitLabel: "day",
+                    buckets: buckets.map {
+                        PiChartBucket(
+                            startDate: $0.day,
+                            endDate: $0.day,
+                            totalTokens: $0.totalTokens)
+                    }),
+            ])
     }
 
     required init?(coder: NSCoder) {
@@ -58,6 +115,40 @@ final class PiUsageSummaryChartView: NSView {
 
     override var intrinsicContentSize: NSSize {
         self.viewSize
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override func layout() {
+        super.layout()
+        self.rangeControl.frame = self.rangeSelectorRect(
+            in: self.plotRect(in: self.chartRect()))
+        self.updateRangeControlTrackingArea()
+    }
+
+    private func updateRangeControlTrackingArea() {
+        if let trackingArea = self.rangeControlTrackingArea {
+            self.rangeControl.removeTrackingArea(trackingArea)
+            self.rangeControlTrackingArea = nil
+        }
+
+        let options: NSTrackingArea.Options = [
+            .mouseEnteredAndExited,
+            .mouseMoved,
+            .activeAlways,
+            .inVisibleRect,
+        ]
+        let trackingArea = NSTrackingArea(
+            rect: self.rangeControl.bounds,
+            options: options,
+            owner: self,
+            userInfo: nil)
+        self.rangeControl.addTrackingArea(trackingArea)
+        self.rangeControlTrackingArea = trackingArea
     }
 
     override func updateTrackingAreas() {
@@ -96,6 +187,7 @@ final class PiUsageSummaryChartView: NSView {
             return
         }
         self.window?.acceptsMouseMovedEvents = true
+        self.needsLayout = true
     }
 
     override func mouseEntered(with event: NSEvent) {
@@ -111,6 +203,44 @@ final class PiUsageSummaryChartView: NSView {
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
         self.setHoveredBucket(nil)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let location = self.convert(event.locationInWindow, from: nil)
+        let selectorRect = self.rangeSelectorRect(in: self.plotRect(in: self.chartRect()))
+        if let index = Self.rangeIndex(at: location, in: selectorRect, count: self.chartRanges.count),
+           self.chartRanges.indices.contains(index)
+        {
+            // Native segmented-control tracking normally handles this. The
+            // fallback also makes the selector work when NSMenu routes the first
+            // click to the containing custom view instead of its subview.
+            self.selectRange(self.chartRanges[index])
+            return
+        }
+        // The chart has no click action. Consume the event so selecting or
+        // inspecting it does not turn into a menu-item selection and dismiss
+        // the still-open menu.
+    }
+
+    override func keyDown(with event: NSEvent) {
+        let delta: Int?
+        switch event.keyCode {
+        case 123: delta = -1 // left arrow
+        case 124: delta = 1 // right arrow
+        default: delta = nil
+        }
+
+        if let delta,
+           let currentIndex = self.chartRanges.firstIndex(of: self.activeRange),
+           !self.chartRanges.isEmpty
+        {
+            let nextIndex = min(
+                max(currentIndex + delta, self.chartRanges.startIndex),
+                self.chartRanges.index(before: self.chartRanges.endIndex))
+            self.selectRange(self.chartRanges[nextIndex])
+            return
+        }
+        super.keyDown(with: event)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -185,28 +315,33 @@ final class PiUsageSummaryChartView: NSView {
     private func drawChart(in chartRect: NSRect) {
         guard chartRect.width > 0, chartRect.height > 0 else { return }
 
+        let dataset = self.selectedDataset
+        let buckets = dataset.buckets
         let plotRect = self.plotRect(in: chartRect)
+        let selectorRect = self.rangeSelectorRect(in: plotRect)
+        let headerGap: CGFloat = 6
+        let peakWidth = min(104, max(78, plotRect.width * 0.28))
+        let peakRect = NSRect(
+            x: max(plotRect.minX, selectorRect.minX - headerGap - peakWidth),
+            y: selectorRect.minY,
+            width: peakWidth,
+            height: Self.headerHeight)
+        let titleRect = NSRect(
+            x: plotRect.minX,
+            y: selectorRect.minY,
+            width: max(1, peakRect.minX - headerGap - plotRect.minX),
+            height: Self.headerHeight)
 
-        let headerGap: CGFloat = 8
-        let headerWidth = max(1, (plotRect.width - headerGap) / 2)
         self.drawFittedText(
-            "Token usage · 90d",
-            in: NSRect(
-                x: plotRect.minX,
-                y: plotRect.maxY + 4,
-                width: headerWidth,
-                height: 15),
+            "Token usage · \(dataset.title)",
+            in: titleRect,
             fontSize: 11,
-            minimumFontSize: 9,
+            minimumFontSize: 8,
             weight: .semibold,
             color: .labelColor)
         self.drawFittedText(
-            "Peak \(Self.compactTokenLabel(self.peakTokens))/day",
-            in: NSRect(
-                x: plotRect.minX + headerWidth + headerGap,
-                y: plotRect.maxY + 4,
-                width: headerWidth,
-                height: 15),
+            "Peak \(Self.compactTokenLabel(self.peakTokens))/\(dataset.unitLabel)",
+            in: peakRect,
             fontSize: 10,
             minimumFontSize: 8,
             color: .secondaryLabelColor,
@@ -222,12 +357,14 @@ final class PiUsageSummaryChartView: NSView {
         self.drawHoverHighlight(in: plotRect)
         self.drawGrid(in: plotRect)
 
-        let values = self.buckets.map { max(0, $0.totalTokens) }
+        let values = buckets.map { max(0, $0.totalTokens) }
         self.drawBars(values: values, in: plotRect)
         self.drawHoverCallout(in: plotRect)
 
         let secondaryColor = NSColor.secondaryLabelColor
-        let firstBucketLabel = self.buckets.first?.day.formatted(date: .abbreviated, time: .omitted) ?? "89d ago"
+        let firstBucketLabel = buckets.first.map {
+            Self.exactLocalDateLabel($0.startDate)
+        } ?? "No data"
         self.drawFittedText(
             firstBucketLabel,
             in: NSRect(x: plotRect.minX, y: 2, width: plotRect.width / 3, height: 14),
@@ -261,17 +398,52 @@ final class PiUsageSummaryChartView: NSView {
     private func plotRect(in chartRect: NSRect) -> NSRect {
         NSRect(
             x: Self.horizontalInset,
-            y: 23,
+            y: 22,
             width: max(1, chartRect.width - (Self.horizontalInset * 2)),
-            height: max(1, chartRect.height - 50))
+            height: max(1, chartRect.height - 61))
+    }
+
+    private func rangeSelectorRect(in plotRect: NSRect) -> NSRect {
+        let fittingWidth = self.rangeControl.fittingSize.width
+        let desiredWidth = fittingWidth.isFinite && fittingWidth > 0
+            ? ceil(fittingWidth)
+            : 144
+        let width = min(plotRect.width, max(144, min(170, desiredWidth)))
+        return NSRect(
+            x: plotRect.maxX - width,
+            y: plotRect.maxY + 3,
+            width: width,
+            height: Self.headerHeight)
+    }
+
+    /// Pure geometry used by the custom-view click fallback and easy to verify
+    /// independently of NSMenu tracking.
+    static func rangeIndex(at point: NSPoint, in rect: NSRect, count: Int) -> Int? {
+        guard count > 0,
+              rect.width > 0,
+              rect.height > 0,
+              rect.contains(point)
+        else {
+            return nil
+        }
+        let segmentWidth = rect.width / CGFloat(count)
+        guard segmentWidth.isFinite, segmentWidth > 0 else { return nil }
+        let rawIndex = Int(((point.x - rect.minX) / segmentWidth).rounded(.down))
+        return min(max(rawIndex, 0), count - 1)
     }
 
     private func updateHoveredBucket(at location: NSPoint) {
+        let selectorRect = self.rangeSelectorRect(in: self.plotRect(in: self.chartRect()))
+        if selectorRect.contains(location) {
+            self.setHoveredBucket(nil)
+            return
+        }
         self.setHoveredBucket(self.bucketIndex(at: location))
     }
 
     private func bucketIndex(at location: NSPoint) -> Int? {
-        guard !self.buckets.isEmpty else { return nil }
+        let buckets = self.selectedDataset.buckets
+        guard !buckets.isEmpty else { return nil }
 
         let plotRect = self.plotRect(in: self.chartRect())
         guard plotRect.width > 0,
@@ -284,20 +456,41 @@ final class PiUsageSummaryChartView: NSView {
             return nil
         }
 
-        let slotWidth = plotRect.width / CGFloat(self.buckets.count)
+        let slotWidth = plotRect.width / CGFloat(buckets.count)
         guard slotWidth.isFinite, slotWidth > 0 else { return nil }
 
         let position = (location.x - plotRect.minX) / slotWidth
         guard position.isFinite else { return nil }
 
-        // Clamp the right edge so a point exactly on plotRect.maxX still selects today.
+        // Clamp the right edge so a point exactly on plotRect.maxX still selects the last bucket.
         let index = Int(position.rounded(.down))
-        return min(max(index, 0), self.buckets.count - 1)
+        return min(max(index, 0), buckets.count - 1)
+    }
+
+    private func selectRange(_ range: PiChartRange) {
+        guard self.datasets[range] != nil else { return }
+        self.activeRange = range
+        if let index = self.chartRanges.firstIndex(of: range) {
+            self.rangeControl.selectedSegment = index
+        }
+        self.setHoveredBucket(nil)
+        self.updateAccessibilityForSelection()
+        self.needsDisplay = true
+    }
+
+    @objc private func rangeControlChanged(_ sender: NSSegmentedControl) {
+        guard sender === self.rangeControl,
+              self.chartRanges.indices.contains(sender.selectedSegment)
+        else {
+            return
+        }
+        self.selectRange(self.chartRanges[sender.selectedSegment])
     }
 
     private func setHoveredBucket(_ index: Int?) {
+        let buckets = self.selectedDataset.buckets
         let normalizedIndex: Int?
-        if let index, self.buckets.indices.contains(index) {
+        if let index, buckets.indices.contains(index) {
             normalizedIndex = index
         } else {
             normalizedIndex = nil
@@ -309,31 +502,42 @@ final class PiUsageSummaryChartView: NSView {
         self.needsDisplay = true
     }
 
+    private func updateAccessibilityForSelection() {
+        let dataset = self.selectedDataset
+        self.setAccessibilityLabel("Pi usage summaries and \(dataset.title) token usage chart")
+        self.setAccessibilityValue(self.makeAccessibilitySummary())
+        self.setAccessibilityHelp(Self.hoverAccessibilityHelp)
+        self.toolTip = self.makeAccessibilitySummary()
+        self.rangeControl.toolTip = "Selected Pi chart range: \(dataset.title)"
+    }
+
     private func updateAccessibilityForHover() {
+        let summary = self.makeAccessibilitySummary()
         guard let index = self.hoveredBucketIndex,
-              self.buckets.indices.contains(index)
+              self.selectedDataset.buckets.indices.contains(index)
         else {
-            self.setAccessibilityValue(self.accessibilitySummary)
+            self.setAccessibilityValue(summary)
             self.setAccessibilityHelp(Self.hoverAccessibilityHelp)
-            self.toolTip = self.accessibilitySummary
+            self.toolTip = summary
             return
         }
 
-        let detail = Self.hoverDetail(for: self.buckets[index])
-        let hoverText = "Hovered day: \(detail)."
-        self.setAccessibilityValue("\(self.accessibilitySummary) \(hoverText)")
+        let bucket = self.selectedDataset.buckets[index]
+        let detail = Self.hoverDetail(for: bucket)
+        let hoverText = "Hovered \(self.selectedDataset.unitLabel): \(detail)."
+        self.setAccessibilityValue("\(summary) \(hoverText)")
         self.setAccessibilityHelp("\(hoverText) \(Self.hoverAccessibilityHelp)")
-        self.toolTip = "\(self.accessibilitySummary) \(hoverText)"
+        self.toolTip = "\(summary) \(hoverText)"
     }
 
     private func drawHoverHighlight(in plotRect: NSRect) {
         guard let index = self.hoveredBucketIndex,
-              self.buckets.indices.contains(index)
+              self.selectedDataset.buckets.indices.contains(index)
         else {
             return
         }
 
-        let slot = self.slotRect(for: index, count: self.buckets.count, in: plotRect)
+        let slot = self.slotRect(for: index, count: self.selectedDataset.buckets.count, in: plotRect)
         let inset = min(0.5, min(slot.width, slot.height) / 2)
         let highlightRect = slot.insetBy(dx: inset, dy: inset)
         guard highlightRect.width > 0, highlightRect.height > 0 else { return }
@@ -350,14 +554,15 @@ final class PiUsageSummaryChartView: NSView {
     }
 
     private func drawHoverCallout(in plotRect: NSRect) {
+        let buckets = self.selectedDataset.buckets
         guard let index = self.hoveredBucketIndex,
-              self.buckets.indices.contains(index)
+              buckets.indices.contains(index)
         else {
             return
         }
 
-        let bucket = self.buckets[index]
-        let dateText = Self.exactLocalDateLabel(bucket.day)
+        let bucket = buckets[index]
+        let dateText = Self.dateRangeLabel(for: bucket)
         let tokenText = "\(Self.exactTokenCountLabel(max(0, bucket.totalTokens))) tokens"
         let dateFont = NSFont.systemFont(ofSize: 9, weight: .semibold)
         let tokenFont = NSFont.systemFont(ofSize: 10, weight: .medium)
@@ -382,11 +587,11 @@ final class PiUsageSummaryChartView: NSView {
 
         let calloutWidth = min(availableRect.width, max(96, desiredWidth))
         let calloutHeight = min(availableRect.height, desiredHeight)
-        let slot = self.slotRect(for: index, count: self.buckets.count, in: plotRect)
+        let slot = self.slotRect(for: index, count: buckets.count, in: plotRect)
         let barTop = self.barRect(
             for: max(0, bucket.totalTokens),
             at: index,
-            count: self.buckets.count,
+            count: buckets.count,
             in: plotRect)?.maxY ?? plotRect.minY
         let gap: CGFloat = 4
         let preferredY = barTop + gap
@@ -502,14 +707,20 @@ final class PiUsageSummaryChartView: NSView {
         date.formatted(date: .abbreviated, time: .omitted)
     }
 
+    private static func dateRangeLabel(for bucket: PiChartBucket) -> String {
+        let start = self.exactLocalDateLabel(bucket.startDate)
+        guard bucket.startDate != bucket.endDate else { return start }
+        return "\(start) – \(self.exactLocalDateLabel(bucket.endDate))"
+    }
+
     private static func exactTokenCountLabel(_ value: Int) -> String {
         value.formatted(.number.grouping(.automatic))
     }
 
-    private static func hoverDetail(for bucket: PiDailyUsageBucket) -> String {
-        let date = self.exactLocalDateLabel(bucket.day)
+    private static func hoverDetail(for bucket: PiChartBucket) -> String {
+        let dates = self.dateRangeLabel(for: bucket)
         let tokens = self.exactTokenCountLabel(max(0, bucket.totalTokens))
-        return "\(date): \(tokens) tokens"
+        return "\(dates): \(tokens) tokens"
     }
 
     private func drawGrid(in plotRect: NSRect) {
@@ -542,7 +753,7 @@ final class PiUsageSummaryChartView: NSView {
             return
         }
 
-        let todayIndex = values.index(before: values.endIndex)
+        let lastIndex = values.index(before: values.endIndex)
         for (index, value) in values.enumerated() {
             guard let barRect = self.barRect(
                 for: value,
@@ -558,8 +769,8 @@ final class PiUsageSummaryChartView: NSView {
                 xRadius: min(1, barRect.width / 2),
                 yRadius: min(1, barRect.height / 2))
 
-            // A slightly stronger final bar marks today without competing with the data.
-            let color = index == todayIndex
+            // A slightly stronger final bar marks the last bucket (which is today).
+            let color = index == lastIndex
                 ? NSColor.controlAccentColor
                 : NSColor.controlAccentColor.withAlphaComponent(0.58)
             color.setFill()
@@ -649,31 +860,42 @@ final class PiUsageSummaryChartView: NSView {
         return min(Self.maximumWidth, max(Self.minimumWidth, measuredWidth))
     }
 
+    private func makeAccessibilitySummary() -> String {
+        Self.makeAccessibilitySummary(
+            summaries: self.summaries,
+            dataset: self.selectedDataset)
+    }
+
     private static func makeAccessibilitySummary(
         summaries: [Summary],
-        buckets: [PiDailyUsageBucket]
+        dataset: PiChartDataset
     ) -> String {
         let summaryText = summaries.map { "\($0.title): \($0.detail)" }.joined(separator: ". ")
-        let graphText = self.makeGraphAccessibilitySummary(buckets: buckets)
+        let graphText = self.makeGraphAccessibilitySummary(dataset: dataset)
         if summaryText.isEmpty { return graphText }
         return "\(summaryText). \(graphText)"
     }
 
-    private static func makeGraphAccessibilitySummary(buckets: [PiDailyUsageBucket]) -> String {
-        let values = buckets.map { max(0, $0.totalTokens) }
+    private static func makeGraphAccessibilitySummary(dataset: PiChartDataset) -> String {
+        let values = dataset.buckets.map { max(0, $0.totalTokens) }
         let peak = values.max() ?? 0
-        let activeDays = values.filter { $0 > 0 }.count
-        let today = values.last ?? 0
+        let activeBuckets = values.filter { $0 > 0 }.count
+        let lastValue = values.last ?? 0
 
-        guard !buckets.isEmpty else {
-            return "Pi token usage chart for the last 90 days is unavailable."
+        guard let first = dataset.buckets.first,
+              let last = dataset.buckets.last
+        else {
+            return "Pi token usage chart for \(dataset.title) has no eligible usage rows."
         }
-        let firstBucketLabel = buckets[0].day.formatted(date: .abbreviated, time: .omitted)
+
+        let firstLabel = self.exactLocalDateLabel(first.startDate)
+        let lastLabel = self.exactLocalDateLabel(last.endDate)
+        let bucketNoun = dataset.unitLabel == "day" ? "days" : "\(dataset.unitLabel)s"
         guard peak > 0 else {
-            return "No Pi token usage recorded in 90 local calendar days from \(firstBucketLabel) through today. All 90 daily buckets are zero."
+            return "No Pi token usage recorded in \(dataset.title) from \(firstLabel) through \(lastLabel). All \(values.count) \(bucketNoun) are zero."
         }
 
-        return "Pi token usage chart for 90 local calendar days from \(firstBucketLabel) through today: \(activeDays) days with usage; peak \(Self.compactTokenLabel(peak)) tokens in one day; today \(Self.compactTokenLabel(today)) tokens."
+        return "Pi token usage chart for \(dataset.title) from \(firstLabel) through \(lastLabel), grouped by \(dataset.unitLabel): \(activeBuckets) \(bucketNoun) with usage; peak \(Self.compactTokenLabel(peak)) tokens in one \(dataset.unitLabel); latest bucket \(Self.compactTokenLabel(lastValue)) tokens."
     }
 
     private static func compactTokenLabel(_ value: Int) -> String {
@@ -700,5 +922,9 @@ final class PiUsageSummaryChartView: NSView {
             ? String(format: "%.0f", scaled)
             : String(format: "%.1f", scaled)
         return "\(text)\(suffix)"
+    }
+
+    private var peakTokens: Int {
+        self.selectedDataset.buckets.map { max(0, $0.totalTokens) }.max() ?? 0
     }
 }

@@ -145,6 +145,42 @@ struct OpenCodeSnapshot: Sendable {
     let updatedAt: Date
 }
 
+enum PiChartRange: String, CaseIterable, Hashable, Sendable {
+    case ninetyDays = "90d"
+    case sixMonths = "6m"
+    case oneYear = "1y"
+    case all = "all"
+
+    var title: String {
+        switch self {
+        case .ninetyDays: "90d"
+        case .sixMonths: "6m"
+        case .oneYear: "1y"
+        case .all: "All"
+        }
+    }
+}
+
+/// A chart bucket covers local calendar days inclusively. `startDate` and `endDate`
+/// are both local start-of-day values; a daily bucket therefore has equal dates.
+struct PiChartBucket: Sendable, Equatable {
+    let startDate: Date
+    let endDate: Date
+    let totalTokens: Int
+}
+
+/// Precomputed data for one selectable chart range. Keeping range metadata beside
+/// the buckets lets the view change ranges without re-reading or re-aggregating rows.
+struct PiChartDataset: Sendable, Equatable {
+    let range: PiChartRange
+    let unitLabel: String
+    let buckets: [PiChartBucket]
+
+    var rangeKey: String { self.range.rawValue }
+    var rangeTitle: String { self.range.title }
+    var title: String { self.rangeTitle }
+}
+
 struct PiUsageRow: Sendable {
     let timeCreated: Date
     let sessionFile: String
