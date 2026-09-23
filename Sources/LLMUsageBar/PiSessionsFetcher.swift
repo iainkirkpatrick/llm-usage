@@ -386,7 +386,12 @@ struct PiSessionsFetcher: Sendable {
 
         let chunkSize = 64 * 1024
         var pending = Data()
-        while let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty {
+        while try autoreleasepool(invoking: { () throws -> Bool in
+            // FileHandle's returned NSData is autoreleased. Drain it for every chunk,
+            // not only for each JSON record (a single record can span thousands of reads).
+            guard let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty else {
+                return false
+            }
             chunk.withUnsafeBytes { (rawBuffer: UnsafeRawBufferPointer) in
                 guard let base = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
                     return
@@ -417,7 +422,8 @@ struct PiSessionsFetcher: Sendable {
                     cursor = newlineOffset + 1
                 }
             }
-        }
+            return true
+        }) {}
         if !pending.isEmpty {
             if pending.last == 0x0D { pending.removeLast() }
             body(pending)
