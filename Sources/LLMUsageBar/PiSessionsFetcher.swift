@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 enum PiSessionsError: LocalizedError {
@@ -12,16 +13,58 @@ enum PiSessionsError: LocalizedError {
 }
 
 struct PiSessionsFetcher: Sendable {
-    private struct ParsedUsageRow {
+    private struct ParsedUsageRow: Sendable {
         let row: PiUsageRow
         let subagentIdentity: String?
     }
 
-    private struct ParsedSession {
+    private struct ParsedSession: Sendable {
         let rows: [ParsedUsageRow]
         let isFork: Bool
     }
 
+    private struct FileIdentity: Equatable {
+        let path: String
+        let size: Int
+        let modificationDate: Date
+        let inode: UInt64?
+        let deduplicateForkHistory: Bool
+    }
+
+    private struct CachedFile {
+        let identity: FileIdentity
+        let parsed: ParsedSession
+    }
+
+    private final class SessionCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var files: [String: CachedFile] = [:]
+
+        func parsed(for identity: FileIdentity) -> ParsedSession? {
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            return self.files[identity.path]?.identity == identity
+                ? self.files[identity.path]?.parsed
+                : nil
+        }
+
+        func store(_ parsed: ParsedSession, for identity: FileIdentity) {
+            self.lock.lock()
+            self.files[identity.path] = CachedFile(identity: identity, parsed: parsed)
+            self.lock.unlock()
+        }
+
+        func removeMissingFiles(in directory: URL, presentPaths: Set<String>) {
+            let prefix = directory.path.hasSuffix("/") ? directory.path : directory.path + "/"
+            self.lock.lock()
+            self.files = self.files.filter { path, _ in
+                !path.hasPrefix(prefix) || presentPaths.contains(path)
+            }
+            self.lock.unlock()
+        }
+    }
+
+    private let cache = SessionCache()
     private let defaultSessionsDirectory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".pi/agent/sessions", isDirectory: true)
 
@@ -37,12 +80,30 @@ struct PiSessionsFetcher: Sendable {
 
         if exists {
             files = try self.sessionFiles(at: directoryURL)
+            let presentPaths = Set(files.map(\.path))
+            self.cache.removeMissingFiles(in: directoryURL, presentPaths: presentPaths)
             for fileURL in files {
-                guard let parsed = try? self.parseSessionFile(
-                    fileURL,
+                guard let identity = self.fileIdentity(
+                    for: fileURL,
                     deduplicateForkHistory: deduplicateForkHistory)
                 else {
                     continue
+                }
+
+                let parsed: ParsedSession
+                if let cached = self.cache.parsed(for: identity) {
+                    parsed = cached
+                } else {
+                    guard let fresh = try? self.parseSessionFile(
+                        fileURL,
+                        deduplicateForkHistory: deduplicateForkHistory)
+                    else {
+                        continue
+                    }
+                    parsed = fresh
+                    if self.fileIdentity(for: fileURL, deduplicateForkHistory: deduplicateForkHistory) == identity {
+                        self.cache.store(fresh, for: identity)
+                    }
                 }
 
                 if parsed.isFork {
@@ -78,6 +139,22 @@ struct PiSessionsFetcher: Sendable {
         )
     }
 
+    private func fileIdentity(for fileURL: URL, deduplicateForkHistory: Bool) -> FileIdentity? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+              let size = attributes[.size] as? Int,
+              let modificationDate = attributes[.modificationDate] as? Date
+        else {
+            return nil
+        }
+        let fileNumber = attributes[.systemFileNumber] as? NSNumber
+        return FileIdentity(
+            path: fileURL.path,
+            size: size,
+            modificationDate: modificationDate,
+            inode: fileNumber?.uint64Value,
+            deduplicateForkHistory: deduplicateForkHistory)
+    }
+
     private func resolveSessionsDirectory(_ rawPath: String?) -> URL {
         guard let rawPath = rawPath?.trimmingCharacters(in: .whitespacesAndNewlines), !rawPath.isEmpty else {
             return self.defaultSessionsDirectory.standardizedFileURL
@@ -108,7 +185,10 @@ struct PiSessionsFetcher: Sendable {
     }
 
     private func parseSessionFile(_ fileURL: URL, deduplicateForkHistory: Bool) throws -> ParsedSession {
-        let text = try String(contentsOf: fileURL, encoding: .utf8)
+        let fractionalDateFormatter = ISO8601DateFormatter()
+        fractionalDateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let plainDateFormatter = ISO8601DateFormatter()
+        plainDateFormatter.formatOptions = [.withInternetDateTime]
 
         var sessionID: String?
         var cwd: String?
@@ -116,32 +196,88 @@ struct PiSessionsFetcher: Sendable {
         var isFork = false
         var rows: [ParsedUsageRow] = []
 
-        for rawLine in text.split(whereSeparator: \.isNewline) {
-            guard let dict = Self.jsonObject(from: rawLine) else { continue }
-            guard let type = dict["type"] as? String else { continue }
+        try self.forEachJSONLLine(in: fileURL) { rawLine in
+            autoreleasepool {
+                guard let dict = Self.jsonObject(from: rawLine) else { return }
+                guard let type = dict["type"] as? String else { return }
 
-            if type == "session" {
-                sessionID = Self.normalizedString(dict["id"])
-                cwd = Self.normalizedString(dict["cwd"])
-                sessionStartedAt = Self.parseISODate(dict["timestamp"])
-                isFork = Self.normalizedString(dict["parentSession"]) != nil
-                continue
-            }
+                if type == "session" {
+                    sessionID = Self.normalizedString(dict["id"])
+                    cwd = Self.normalizedString(dict["cwd"])
+                    sessionStartedAt = Self.parseISODate(
+                        dict["timestamp"], fractional: fractionalDateFormatter, plain: plainDateFormatter)
+                    isFork = Self.normalizedString(dict["parentSession"]) != nil
+                    return
+                }
 
-            guard type == "message",
-                  let message = dict["message"] as? [String: Any]
-            else {
-                continue
-            }
-
-            let role = message["role"] as? String
-            if role == "assistant" {
-                guard let usage = message["usage"] as? [String: Any],
-                      let timeCreated = Self.parseISODate(dict["timestamp"])
-                          ?? Self.parseMessageTimestamp(message["timestamp"])
-                          ?? sessionStartedAt
+                guard type == "message",
+                      let message = dict["message"] as? [String: Any]
                 else {
-                    continue
+                    return
+                }
+
+                let role = message["role"] as? String
+                if role == "assistant" {
+                    guard let usage = message["usage"] as? [String: Any],
+                          let timeCreated = Self.parseISODate(
+                        dict["timestamp"], fractional: fractionalDateFormatter, plain: plainDateFormatter)
+                              ?? Self.parseMessageTimestamp(
+                                message["timestamp"], fractional: fractionalDateFormatter, plain: plainDateFormatter)
+                              ?? sessionStartedAt
+                    else {
+                        return
+                    }
+
+                    if deduplicateForkHistory,
+                       isFork,
+                       let sessionStartedAt,
+                       timeCreated < sessionStartedAt
+                    {
+                        return
+                    }
+
+                    let inputTokens = Self.usageInt(usage, key: "input")
+                    let outputTokens = Self.usageInt(usage, key: "output")
+                    let cacheReadTokens = Self.usageInt(usage, key: "cacheRead")
+                    let cacheWriteTokens = Self.usageInt(usage, key: "cacheWrite")
+                    let computedTotalTokens = PiTokenTotals.saturatedNonnegativeSum([
+                        inputTokens,
+                        outputTokens,
+                        cacheReadTokens,
+                        cacheWriteTokens,
+                    ])
+                    let totalTokens = Self.usageInt(usage, key: "totalTokens", default: computedTotalTokens)
+                    let cost = Self.assistantCost(usage)
+
+                    let row = PiUsageRow(
+                        timeCreated: timeCreated,
+                        sessionFile: fileURL.path,
+                        sessionID: sessionID,
+                        cwd: cwd,
+                        provider: Self.normalizedString(message["provider"]),
+                        model: Self.normalizedString(message["model"]),
+                        inputTokens: inputTokens,
+                        outputTokens: outputTokens,
+                        cacheReadTokens: cacheReadTokens,
+                        cacheWriteTokens: cacheWriteTokens,
+                        totalTokens: totalTokens,
+                        costUSD: cost,
+                        requestCount: 1
+                    )
+                    rows.append(ParsedUsageRow(row: row, subagentIdentity: nil))
+                    return
+                }
+
+                guard role == "toolResult",
+                      (message["toolName"] as? String) == "subagent",
+                      let details = message["details"] as? [String: Any],
+                      let results = details["results"] as? [Any],
+                      let timeCreated = Self.parseISODate(
+                        dict["timestamp"], fractional: fractionalDateFormatter, plain: plainDateFormatter)
+                          ?? Self.parseMessageTimestamp(
+                            message["timestamp"], fractional: fractionalDateFormatter, plain: plainDateFormatter)
+                else {
+                    return
                 }
 
                 if deduplicateForkHistory,
@@ -149,110 +285,61 @@ struct PiSessionsFetcher: Sendable {
                    let sessionStartedAt,
                    timeCreated < sessionStartedAt
                 {
-                    continue
+                    return
                 }
 
-                let inputTokens = Self.usageInt(usage, key: "input")
-                let outputTokens = Self.usageInt(usage, key: "output")
-                let cacheReadTokens = Self.usageInt(usage, key: "cacheRead")
-                let cacheWriteTokens = Self.usageInt(usage, key: "cacheWrite")
-                let computedTotalTokens = PiTokenTotals.saturatedNonnegativeSum([
-                    inputTokens,
-                    outputTokens,
-                    cacheReadTokens,
-                    cacheWriteTokens,
-                ])
-                let totalTokens = Self.usageInt(usage, key: "totalTokens", default: computedTotalTokens)
-                let cost = Self.assistantCost(usage)
+                for (resultIndex, rawResult) in results.enumerated() {
+                    guard let result = rawResult as? [String: Any],
+                          !Self.isIncompleteSubagentResult(result),
+                          let usage = result["usage"] as? [String: Any],
+                          let inputTokens = Self.optionalUsageInt(usage, key: "input"),
+                          let outputTokens = Self.optionalUsageInt(usage, key: "output"),
+                          let cacheReadTokens = Self.optionalUsageInt(usage, key: "cacheRead"),
+                          let cacheWriteTokens = Self.optionalUsageInt(usage, key: "cacheWrite"),
+                          let cost = Self.optionalUsageDouble(usage, key: "cost")
+                    else {
+                        // A tool result can be persisted while an individual subagent result is
+                        // incomplete. Do not make an unusable result into a zero-cost usage row.
+                        continue
+                    }
 
-                let row = PiUsageRow(
-                    timeCreated: timeCreated,
-                    sessionFile: fileURL.path,
-                    sessionID: sessionID,
-                    cwd: cwd,
-                    provider: Self.normalizedString(message["provider"]),
-                    model: Self.normalizedString(message["model"]),
-                    inputTokens: inputTokens,
-                    outputTokens: outputTokens,
-                    cacheReadTokens: cacheReadTokens,
-                    cacheWriteTokens: cacheWriteTokens,
-                    totalTokens: totalTokens,
-                    costUSD: cost,
-                    requestCount: 1
-                )
-                rows.append(ParsedUsageRow(row: row, subagentIdentity: nil))
-                continue
-            }
+                    let totalTokens = PiTokenTotals.saturatedNonnegativeSum([
+                        inputTokens,
+                        outputTokens,
+                        cacheReadTokens,
+                        cacheWriteTokens,
+                    ])
+                    let turns = Self.optionalUsageInt(usage, key: "turns") ?? 0
+                    let hasNonzeroUsage = totalTokens > 0 || cost > 0
+                    let requestCount = turns > 0 ? turns : (hasNonzeroUsage ? 1 : 0)
 
-            guard role == "toolResult",
-                  (message["toolName"] as? String) == "subagent",
-                  let details = message["details"] as? [String: Any],
-                  let results = details["results"] as? [Any],
-                  let timeCreated = Self.parseISODate(dict["timestamp"])
-                      ?? Self.parseMessageTimestamp(message["timestamp"])
-            else {
-                continue
-            }
-
-            if deduplicateForkHistory,
-               isFork,
-               let sessionStartedAt,
-               timeCreated < sessionStartedAt
-            {
-                continue
-            }
-
-            for (resultIndex, rawResult) in results.enumerated() {
-                guard let result = rawResult as? [String: Any],
-                      !Self.isIncompleteSubagentResult(result),
-                      let usage = result["usage"] as? [String: Any],
-                      let inputTokens = Self.optionalUsageInt(usage, key: "input"),
-                      let outputTokens = Self.optionalUsageInt(usage, key: "output"),
-                      let cacheReadTokens = Self.optionalUsageInt(usage, key: "cacheRead"),
-                      let cacheWriteTokens = Self.optionalUsageInt(usage, key: "cacheWrite"),
-                      let cost = Self.optionalUsageDouble(usage, key: "cost")
-                else {
-                    // A tool result can be persisted while an individual subagent result is
-                    // incomplete. Do not make an unusable result into a zero-cost usage row.
-                    continue
-                }
-
-                let totalTokens = PiTokenTotals.saturatedNonnegativeSum([
-                    inputTokens,
-                    outputTokens,
-                    cacheReadTokens,
-                    cacheWriteTokens,
-                ])
-                let turns = Self.optionalUsageInt(usage, key: "turns") ?? 0
-                let hasNonzeroUsage = totalTokens > 0 || cost > 0
-                let requestCount = turns > 0 ? turns : (hasNonzeroUsage ? 1 : 0)
-
-                let row = PiUsageRow(
-                    timeCreated: timeCreated,
-                    sessionFile: fileURL.path,
-                    sessionID: sessionID,
-                    cwd: cwd,
-                    provider: nil,
-                    model: Self.normalizedString(result["model"]),
-                    inputTokens: inputTokens,
-                    outputTokens: outputTokens,
-                    cacheReadTokens: cacheReadTokens,
-                    cacheWriteTokens: cacheWriteTokens,
-                    totalTokens: totalTokens,
-                    costUSD: cost,
-                    requestCount: requestCount
-                )
-                rows.append(
-                    ParsedUsageRow(
-                        row: row,
-                        subagentIdentity: Self.subagentIdentity(
-                            entry: dict,
-                            message: message,
-                            result: result,
-                            resultIndex: resultIndex,
-                            timestamp: timeCreated)
+                    let row = PiUsageRow(
+                        timeCreated: timeCreated,
+                        sessionFile: fileURL.path,
+                        sessionID: sessionID,
+                        cwd: cwd,
+                        provider: nil,
+                        model: Self.normalizedString(result["model"]),
+                        inputTokens: inputTokens,
+                        outputTokens: outputTokens,
+                        cacheReadTokens: cacheReadTokens,
+                        cacheWriteTokens: cacheWriteTokens,
+                        totalTokens: totalTokens,
+                        costUSD: cost,
+                        requestCount: requestCount
                     )
-                )
+                    rows.append(
+                        ParsedUsageRow(
+                            row: row,
+                            subagentIdentity: Self.subagentIdentity(
+                                entry: dict,
+                                message: message,
+                                result: result,
+                                resultIndex: resultIndex,
+                                timestamp: timeCreated)
+                        )
+                    )
+                }
             }
         }
 
@@ -293,8 +380,48 @@ struct PiSessionsFetcher: Sendable {
         return "message|toolCall:\(toolCallID ?? "")|timestamp:\(timestamp.timeIntervalSince1970)|result:\(resultIndex)"
     }
 
-    private static func jsonObject(from rawLine: Substring) -> [String: Any]? {
-        self.jsonObject(from: Data(rawLine.utf8))
+    private func forEachJSONLLine(in fileURL: URL, _ body: (Data) -> Void) throws {
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+
+        let chunkSize = 64 * 1024
+        var pending = Data()
+        while let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty {
+            chunk.withUnsafeBytes { (rawBuffer: UnsafeRawBufferPointer) in
+                guard let base = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    return
+                }
+
+                var cursor = 0
+                while cursor < rawBuffer.count {
+                    let searchStart = base.advanced(by: cursor)
+                    guard let newline = memchr(searchStart, 0x0A, rawBuffer.count - cursor) else {
+                        pending.append(searchStart, count: rawBuffer.count - cursor)
+                        break
+                    }
+
+                    let newlineOffset = Int(bitPattern: newline) - Int(bitPattern: base)
+                    let segmentLength = newlineOffset - cursor
+                    if !pending.isEmpty {
+                        pending.append(searchStart, count: segmentLength)
+                        if pending.last == 0x0D { pending.removeLast() }
+                        body(pending)
+                        pending.removeAll(keepingCapacity: true)
+                    } else {
+                        var lineLength = segmentLength
+                        if lineLength > 0, base[newlineOffset - 1] == 0x0D {
+                            lineLength -= 1
+                        }
+                        body(Data(bytes: searchStart, count: lineLength))
+                    }
+                    cursor = newlineOffset + 1
+                }
+            }
+        }
+        if !pending.isEmpty {
+            if pending.last == 0x0D { pending.removeLast() }
+            body(pending)
+        }
     }
 
     private static func jsonObject(from rawLine: Data) -> [String: Any]? {
@@ -306,21 +433,16 @@ struct PiSessionsFetcher: Sendable {
         return dict
     }
 
-    private static func parseISODate(_ value: Any?) -> Date? {
+    private static func parseISODate(
+        _ value: Any?, fractional: ISO8601DateFormatter, plain: ISO8601DateFormatter
+    ) -> Date? {
         guard let string = value as? String else { return nil }
-
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: string) {
-            return date
-        }
-
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        return plain.date(from: string)
+        return fractional.date(from: string) ?? plain.date(from: string)
     }
 
-    private static func parseMessageTimestamp(_ value: Any?) -> Date? {
+    private static func parseMessageTimestamp(
+        _ value: Any?, fractional: ISO8601DateFormatter, plain: ISO8601DateFormatter
+    ) -> Date? {
         switch value {
         case let number as NSNumber:
             guard !Self.isBoolean(number) else { return nil }
@@ -337,7 +459,8 @@ struct PiSessionsFetcher: Sendable {
             guard let raw = Double(string.trimmingCharacters(in: .whitespacesAndNewlines)) else {
                 return nil
             }
-            return self.parseMessageTimestamp(raw as NSNumber)
+            return self.parseMessageTimestamp(
+                raw as NSNumber, fractional: fractional, plain: plain)
         default:
             return nil
         }

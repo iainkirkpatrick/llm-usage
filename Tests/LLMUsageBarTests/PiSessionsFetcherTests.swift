@@ -3,6 +3,34 @@ import XCTest
 @testable import LLMUsageBar
 
 final class PiSessionsFetcherTests: XCTestCase {
+    func testStreamingJSONLLinesHandleChunkBoundariesCRLFMalformedLinesAndUnterminatedFinalLine() throws {
+        let fixture = try self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        var largeMessage = self.assistantMessage(
+            id: "large-entry",
+            timestamp: "2026-09-07T10:05:00Z",
+            input: 10,
+            output: 5,
+            cost: 0.1)
+        largeMessage["padding"] = String(repeating: "x", count: 70_000)
+        let header = try self.jsonLine(self.header(
+            id: "streamed-session", cwd: "/tmp/streamed", timestamp: "2026-09-07T10:00:00Z"))
+        let message = try self.jsonLine(largeMessage)
+        let contents = header + "\r\nnot-json\n{" + "\"type\":\"message\"}\n" + message
+        try contents.write(
+            to: fixture.sessions.appendingPathComponent("streamed.jsonl"),
+            atomically: true,
+            encoding: .utf8)
+
+        let snapshot = try self.fetch(fixture)
+        XCTAssertEqual(snapshot.rows.count, 1)
+        XCTAssertEqual(snapshot.rows.first?.sessionID, "streamed-session")
+        XCTAssertEqual(snapshot.rows.first?.model, "main-model")
+        XCTAssertEqual(snapshot.rows.first?.inputTokens, 10)
+        XCTAssertEqual(snapshot.rows.first?.outputTokens, 5)
+    }
+
     func testAssistantAndCompletedSubagentTotalsUseParentSessionMetadata() throws {
         let fixture = try self.makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -362,6 +390,54 @@ final class PiSessionsFetcherTests: XCTestCase {
         let snapshot = try self.fetch(fixture)
         XCTAssertEqual(snapshot.rows.count, 1)
         XCTAssertNil(snapshot.rows.first { $0.model == "legacy-model" })
+    }
+
+    func testCacheReflectsEditedAndDeletedFiles() throws {
+        let fixture = try self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let fetcher = PiSessionsFetcher()
+        let file = fixture.sessions.appendingPathComponent("session.jsonl")
+        try self.writeJSONLines([
+            self.header(id: "session", cwd: "/tmp/project", timestamp: "2026-09-07T10:00:00Z"),
+            self.assistantMessage(
+                id: "old-entry", timestamp: "2026-09-07T10:01:00Z", input: 1, output: 1, cost: 0.01),
+        ], at: file)
+
+        let first = try fetcher.fetch(sessionsDirectory: fixture.sessions.path, deduplicateForkHistory: true)
+        XCTAssertEqual(first.rows.first?.model, "main-model")
+
+        try self.writeJSONLines([
+            self.header(id: "session", cwd: "/tmp/project", timestamp: "2026-09-07T10:00:00Z"),
+            self.assistantMessage(
+                id: "new-entry", timestamp: "2026-09-07T10:01:00Z", input: 200, output: 100, cost: 0.01),
+        ], at: file)
+        let edited = try fetcher.fetch(sessionsDirectory: fixture.sessions.path, deduplicateForkHistory: true)
+        XCTAssertEqual(edited.rows.count, 1)
+        XCTAssertEqual(edited.rows.first?.inputTokens, 200)
+
+        try FileManager.default.removeItem(at: file)
+        let deleted = try fetcher.fetch(sessionsDirectory: fixture.sessions.path, deduplicateForkHistory: true)
+        XCTAssertTrue(deleted.rows.isEmpty)
+        XCTAssertEqual(deleted.sessionCount, 0)
+    }
+
+    func testCacheRespectsChangedForkDeduplicationFlag() throws {
+        let fixture = try self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let fetcher = PiSessionsFetcher()
+        try self.writeJSONLines([
+            self.header(
+                id: "fork", cwd: "/tmp/project", timestamp: "2026-09-07T11:00:00Z", parentSession: "parent"),
+            self.assistantMessage(
+                id: "copied-entry", timestamp: "2026-09-07T10:30:00Z", input: 1, output: 1, cost: 0.01),
+        ], at: fixture.sessions.appendingPathComponent("fork.jsonl"))
+
+        let filtered = try fetcher.fetch(sessionsDirectory: fixture.sessions.path, deduplicateForkHistory: true)
+        XCTAssertTrue(filtered.rows.isEmpty)
+        let unfiltered = try fetcher.fetch(sessionsDirectory: fixture.sessions.path, deduplicateForkHistory: false)
+        XCTAssertEqual(unfiltered.rows.count, 1)
+        let filteredAgain = try fetcher.fetch(sessionsDirectory: fixture.sessions.path, deduplicateForkHistory: true)
+        XCTAssertTrue(filteredAgain.rows.isEmpty)
     }
 
     private struct Fixture {
