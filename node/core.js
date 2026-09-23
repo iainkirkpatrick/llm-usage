@@ -67,15 +67,22 @@ export function classifyWindows(primary, secondary) {
   return { session: session ?? null, weekly: weekly ?? null };
 }
 
-function nativeAccountID(accountResponse) {
-  const values = [accountResponse, accountResponse?.account];
-  for (const value of values) {
-    if (!value || typeof value !== "object") continue;
-    for (const key of ["accountId", "account_id", "chatgptAccountId", "chatgpt_account_id", "id"]) {
-      if (nonEmptyString(value[key])) return value[key].trim();
-    }
-  }
-  return null;
+const nativeAccountIDKeys = ["accountId", "account_id", "chatgptAccountId", "chatgpt_account_id"];
+
+function collectNativeAccountIDs(value, keys = nativeAccountIDKeys) {
+  if (!value || typeof value !== "object") return [];
+  return keys.filter(key => nonEmptyString(value[key])).map(key => value[key].trim());
+}
+
+function nativeAccountIDs(accountResponse) {
+  return [
+    ...collectNativeAccountIDs(accountResponse),
+    ...collectNativeAccountIDs(accountResponse?.account, [...nativeAccountIDKeys, "id"])
+  ];
+}
+
+function nativeRateLimitsAccountIDs(rateLimitsResponse) {
+  return collectNativeAccountIDs(rateLimitsResponse);
 }
 
 function nativeAccountMetadata(accountResponse) {
@@ -330,7 +337,7 @@ async function initialize(rpc) {
   rpc.child.stdin.write(JSON.stringify({ method: "initialized", params: {} }) + "\n");
 }
 
-async function nativeAccount(rpc, timeoutMs, expectedChatgptAccountId = null) {
+async function nativeAccount(rpc, timeoutMs) {
   let account;
   try {
     account = await withTimeout(rpc.request("account/read", { refreshToken: true }), timeoutMs);
@@ -341,19 +348,27 @@ async function nativeAccount(rpc, timeoutMs, expectedChatgptAccountId = null) {
     account = await withTimeout(rpc.request("account/read"), timeoutMs);
   }
   if (!account?.account) throw new Error("Managed Codex account is not authenticated.");
-  if (expectedChatgptAccountId) {
-    // Reset consumption is fail-closed when this app-server version does not echo an identity.
-    // A credential-file precheck alone is not enough to prove which account the running server
-    // authenticated after an external refresh or replacement.
-    const serverAccountId = nativeAccountID(account);
-    if (!serverAccountId) {
-      throw new Error("Codex app-server did not return a ChatGPT account identity; reset consumption is disabled for this server version.");
-    }
-    if (serverAccountId !== expectedChatgptAccountId) {
-      throw new Error(`Codex app-server authenticated a different ChatGPT account (expected ${expectedChatgptAccountId}, found ${serverAccountId}).`);
-    }
-  }
   return account;
+}
+
+function validateNativeAccountIdentity(accountResponse, rateLimitsResponse, expectedChatgptAccountId) {
+  // Codex 0.154 omits the identity from account/read but returns it at the top level of
+  // account/rateLimits/read. Restrict that response to account-specific keys: a generic `id`
+  // could identify an unrelated rate-limit resource.
+  const accountIds = [...new Set([
+    ...nativeAccountIDs(accountResponse),
+    ...nativeRateLimitsAccountIDs(rateLimitsResponse)
+  ])];
+  if (accountIds.length > 1) {
+    throw new Error(`Codex app-server returned conflicting ChatGPT account identities (${accountIds.join(" and ")}); reset consumption is disabled.`);
+  }
+  const [serverAccountId] = accountIds;
+  if (!serverAccountId) {
+    throw new Error("Codex app-server did not return a ChatGPT account identity; reset consumption is disabled for this server version.");
+  }
+  if (serverAccountId !== expectedChatgptAccountId) {
+    throw new Error(`Codex app-server authenticated a different ChatGPT account (expected ${expectedChatgptAccountId}, found ${serverAccountId}).`);
+  }
 }
 
 async function fetchNativeUsage({ pathToCodex, codexHome, timeoutMs }) {
@@ -491,9 +506,11 @@ export async function consumeCredit({
     const rpc = new RPC(pathToCodex, { codexHome: home });
     try {
       await withTimeout(initialize(rpc), timeoutMs);
-      // This identity check and the irreversible consume request share one app-server process.
-      // The credential snapshot is checked before the server is allowed to consume anything.
-      await nativeAccount(rpc, timeoutMs, expectedAccountId);
+      // Read limits and validate their current identity in this same app-server process immediately
+      // before the irreversible request. The credential snapshot is only an initial precheck.
+      const account = await nativeAccount(rpc, timeoutMs);
+      const rateLimits = await withTimeout(rpc.request("account/rateLimits/read"), timeoutMs);
+      validateNativeAccountIdentity(account, rateLimits, expectedAccountId);
       return await withTimeout(rpc.request("account/rateLimitResetCredit/consume", { creditId, idempotencyKey }), timeoutMs);
     } finally {
       rpc.close();
@@ -508,8 +525,11 @@ export async function consumeCredit({
     return await withTimeout((async () => {
       await initialize(rpc);
       await rpc.request("account/login/start", { type: "chatgptAuthTokens", ...initial, chatgptPlanType: null });
-      // Validate the account after login/refresh and immediately before the irreversible request.
-      await nativeAccount(rpc, timeoutMs, expectedAccountId);
+      // Validate the current rate-limits response after login/refresh and immediately before the
+      // irreversible request. All checks and the consume share one app-server process.
+      const account = await nativeAccount(rpc, timeoutMs);
+      const rateLimits = await rpc.request("account/rateLimits/read");
+      validateNativeAccountIdentity(account, rateLimits, expectedAccountId);
       return rpc.request("account/rateLimitResetCredit/consume", { creditId, idempotencyKey });
     })(), timeoutMs);
   } finally { rpc.close(); }

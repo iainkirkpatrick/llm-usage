@@ -205,7 +205,17 @@ lines.on("line", line => {
   if (message.id == null) return;
   fs.appendFileSync(calls, message.method + "\\n");
   let result = {};
-  if (message.method === "account/read") result = { account: { accountId: "managed-account", email: "managed@example.com" } };
+  if (message.method === "account/read") {
+    const accountId = process.env.LLM_BAR_TEST_ACCOUNT_ID;
+    const accountAlias = process.env.LLM_BAR_TEST_ACCOUNT_ALIAS;
+    const resourceId = process.env.LLM_BAR_TEST_ACCOUNT_RESPONSE_ID;
+    result = { ...(resourceId ? { id: resourceId } : {}), account: { ...(accountId ? { accountId } : {}), ...(accountAlias ? { account_id: accountAlias } : {}), email: "managed@example.com" } };
+  }
+  if (message.method === "account/rateLimits/read") {
+    const accountId = process.env.LLM_BAR_TEST_RATE_LIMITS_ACCOUNT_ID;
+    const resourceId = process.env.LLM_BAR_TEST_RATE_LIMITS_ID;
+    result = { ...(accountId ? { accountId } : {}), ...(resourceId ? { id: resourceId } : {}), rateLimits: { primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: 200 } } };
+  }
   if (message.method === "account/rateLimitResetCredit/consume") result = { outcome: "reset" };
   process.stdout.write(JSON.stringify({ id: message.id, result }) + "\\n");
 });
@@ -214,8 +224,18 @@ lines.on("line", line => {
 exec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)}
 `);
   fs.chmodSync(executable, 0o700);
-  const previous = process.env.LLM_BAR_CODEX_PATH;
+  const previousExecutable = process.env.LLM_BAR_CODEX_PATH;
+  const previousAccountId = process.env.LLM_BAR_TEST_ACCOUNT_ID;
+  const previousAccountAlias = process.env.LLM_BAR_TEST_ACCOUNT_ALIAS;
+  const previousAccountResponseId = process.env.LLM_BAR_TEST_ACCOUNT_RESPONSE_ID;
+  const previousRateLimitsAccountId = process.env.LLM_BAR_TEST_RATE_LIMITS_ACCOUNT_ID;
+  const previousRateLimitsId = process.env.LLM_BAR_TEST_RATE_LIMITS_ID;
   process.env.LLM_BAR_CODEX_PATH = executable;
+  delete process.env.LLM_BAR_TEST_ACCOUNT_ID;
+  delete process.env.LLM_BAR_TEST_ACCOUNT_ALIAS;
+  delete process.env.LLM_BAR_TEST_ACCOUNT_RESPONSE_ID;
+  delete process.env.LLM_BAR_TEST_RATE_LIMITS_ID;
+  process.env.LLM_BAR_TEST_RATE_LIMITS_ACCOUNT_ID = "managed-account";
   try {
     const result = await consumeCredit({
       creditId: "credit",
@@ -226,19 +246,132 @@ exec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)}
     });
     assert.equal(result.outcome, "reset");
     assert.deepEqual(fs.readFileSync(calls, "utf8").trim().split("\n"), [
-      "initialize", "account/read", "account/rateLimitResetCredit/consume"
+      "initialize", "account/read", "account/rateLimits/read", "account/rateLimitResetCredit/consume"
     ]);
+
+    fs.writeFileSync(calls, "");
+    process.env.LLM_BAR_TEST_RATE_LIMITS_ACCOUNT_ID = "other-account";
     await assert.rejects(
-      consumeCredit({ creditId: "credit", idempotencyKey: "other", expectedChatgptAccountId: "other-account", codexHome: home }),
+      consumeCredit({ creditId: "credit", idempotencyKey: "mismatch", expectedChatgptAccountId: "managed-account", codexHome: home, timeoutMs: 2_000 }),
       /different ChatGPT account/
     );
+    assert.deepEqual(fs.readFileSync(calls, "utf8").trim().split("\n"), [
+      "initialize", "account/read", "account/rateLimits/read"
+    ]);
+    assert.equal(fs.readFileSync(calls, "utf8").includes("account/rateLimitResetCredit/consume"), false);
+
+    fs.writeFileSync(calls, "");
+    delete process.env.LLM_BAR_TEST_RATE_LIMITS_ACCOUNT_ID;
+    process.env.LLM_BAR_TEST_RATE_LIMITS_ID = "managed-account";
+    await assert.rejects(
+      consumeCredit({ creditId: "credit", idempotencyKey: "missing", expectedChatgptAccountId: "managed-account", codexHome: home, timeoutMs: 2_000 }),
+      /did not return a ChatGPT account identity/
+    );
+    assert.deepEqual(fs.readFileSync(calls, "utf8").trim().split("\n"), [
+      "initialize", "account/read", "account/rateLimits/read"
+    ]);
+    assert.equal(fs.readFileSync(calls, "utf8").includes("account/rateLimitResetCredit/consume"), false);
+
+    // Generic response IDs are not accepted as account identities.
+    fs.writeFileSync(calls, "");
+    delete process.env.LLM_BAR_TEST_RATE_LIMITS_ID;
+    process.env.LLM_BAR_TEST_ACCOUNT_RESPONSE_ID = "managed-account";
+    await assert.rejects(
+      consumeCredit({ creditId: "credit", idempotencyKey: "generic-account-id", expectedChatgptAccountId: "managed-account", codexHome: home, timeoutMs: 2_000 }),
+      /did not return a ChatGPT account identity/
+    );
+    assert.equal(fs.readFileSync(calls, "utf8").includes("account/rateLimitResetCredit/consume"), false);
+
+    // Older app-server versions reported the identity from account/read instead.
+    fs.writeFileSync(calls, "");
+    delete process.env.LLM_BAR_TEST_ACCOUNT_RESPONSE_ID;
+    process.env.LLM_BAR_TEST_ACCOUNT_ID = "managed-account";
+    await consumeCredit({
+      creditId: "credit",
+      idempotencyKey: "legacy",
+      expectedChatgptAccountId: "managed-account",
+      codexHome: home,
+      timeoutMs: 2_000
+    });
+    assert.equal(fs.readFileSync(calls, "utf8").includes("account/rateLimitResetCredit/consume"), true);
+
+    // Conflicting identities must fail closed even when the newer response matches expectations.
+    fs.writeFileSync(calls, "");
+    process.env.LLM_BAR_TEST_ACCOUNT_ID = "other-account";
+    process.env.LLM_BAR_TEST_RATE_LIMITS_ACCOUNT_ID = "managed-account";
+    await assert.rejects(
+      consumeCredit({ creditId: "credit", idempotencyKey: "conflict", expectedChatgptAccountId: "managed-account", codexHome: home, timeoutMs: 2_000 }),
+      /conflicting ChatGPT account identities/
+    );
+    assert.equal(fs.readFileSync(calls, "utf8").includes("account/rateLimitResetCredit/consume"), false);
+
+    // Conflicting aliases within one response must also fail closed.
+    fs.writeFileSync(calls, "");
+    delete process.env.LLM_BAR_TEST_RATE_LIMITS_ACCOUNT_ID;
+    process.env.LLM_BAR_TEST_ACCOUNT_ID = "managed-account";
+    process.env.LLM_BAR_TEST_ACCOUNT_ALIAS = "other-account";
+    await assert.rejects(
+      consumeCredit({ creditId: "credit", idempotencyKey: "alias-conflict", expectedChatgptAccountId: "managed-account", codexHome: home, timeoutMs: 2_000 }),
+      /conflicting ChatGPT account identities/
+    );
+    assert.equal(fs.readFileSync(calls, "utf8").includes("account/rateLimitResetCredit/consume"), false);
+
+    // Pi handoff follows the same current identity check after token login.
+    fs.writeFileSync(calls, "");
+    delete process.env.LLM_BAR_TEST_ACCOUNT_ID;
+    delete process.env.LLM_BAR_TEST_ACCOUNT_ALIAS;
+    process.env.LLM_BAR_TEST_RATE_LIMITS_ACCOUNT_ID = "managed-account";
+    const piAuthPath = path.join(root, "pi-auth.json");
+    fs.writeFileSync(piAuthPath, JSON.stringify({
+      "openai-codex": {
+        type: "oauth",
+        access: "pi-access",
+        refresh: "pi-refresh",
+        expires: Date.now() + 60_000,
+        accountId: "managed-account"
+      }
+    }));
+    await consumeCredit({
+      creditId: "credit",
+      idempotencyKey: "pi-handoff",
+      expectedChatgptAccountId: "managed-account",
+      authPath: piAuthPath,
+      timeoutMs: 2_000
+    });
+    assert.deepEqual(fs.readFileSync(calls, "utf8").trim().split("\n"), [
+      "initialize", "account/login/start", "account/read", "account/rateLimits/read", "account/rateLimitResetCredit/consume"
+    ]);
+
+    fs.writeFileSync(calls, "");
+    process.env.LLM_BAR_TEST_RATE_LIMITS_ACCOUNT_ID = "other-account";
+    await assert.rejects(
+      consumeCredit({ creditId: "credit", idempotencyKey: "pi-mismatch", expectedChatgptAccountId: "managed-account", authPath: piAuthPath, timeoutMs: 2_000 }),
+      /different ChatGPT account/
+    );
+    assert.deepEqual(fs.readFileSync(calls, "utf8").trim().split("\n"), [
+      "initialize", "account/login/start", "account/read", "account/rateLimits/read"
+    ]);
+    assert.equal(fs.readFileSync(calls, "utf8").includes("account/rateLimitResetCredit/consume"), false);
+
+    fs.writeFileSync(calls, "");
     await assert.rejects(
       consumeCredit({ creditId: "credit", idempotencyKey: "unbound", codexHome: home }),
       /expected-account-id is required/
     );
+    assert.equal(fs.readFileSync(calls, "utf8"), "");
   } finally {
-    if (previous === undefined) delete process.env.LLM_BAR_CODEX_PATH;
-    else process.env.LLM_BAR_CODEX_PATH = previous;
+    if (previousExecutable === undefined) delete process.env.LLM_BAR_CODEX_PATH;
+    else process.env.LLM_BAR_CODEX_PATH = previousExecutable;
+    if (previousAccountId === undefined) delete process.env.LLM_BAR_TEST_ACCOUNT_ID;
+    else process.env.LLM_BAR_TEST_ACCOUNT_ID = previousAccountId;
+    if (previousAccountAlias === undefined) delete process.env.LLM_BAR_TEST_ACCOUNT_ALIAS;
+    else process.env.LLM_BAR_TEST_ACCOUNT_ALIAS = previousAccountAlias;
+    if (previousAccountResponseId === undefined) delete process.env.LLM_BAR_TEST_ACCOUNT_RESPONSE_ID;
+    else process.env.LLM_BAR_TEST_ACCOUNT_RESPONSE_ID = previousAccountResponseId;
+    if (previousRateLimitsAccountId === undefined) delete process.env.LLM_BAR_TEST_RATE_LIMITS_ACCOUNT_ID;
+    else process.env.LLM_BAR_TEST_RATE_LIMITS_ACCOUNT_ID = previousRateLimitsAccountId;
+    if (previousRateLimitsId === undefined) delete process.env.LLM_BAR_TEST_RATE_LIMITS_ID;
+    else process.env.LLM_BAR_TEST_RATE_LIMITS_ID = previousRateLimitsId;
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
