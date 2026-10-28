@@ -669,7 +669,7 @@ struct PiAuthStore: Sendable {
             .appendingPathComponent("\(self.authURL.lastPathComponent).lock", isDirectory: true)
     }
 
-    fileprivate func withLockedDocument<T>(_ body: (PiAuthDocument, HandoffDirectoryLock) throws -> T) throws -> T {
+    fileprivate func withLockedDocument<T>(createIfMissing: Bool = true, _ body: (PiAuthDocument, HandoffDirectoryLock) throws -> T) throws -> T {
         try self.ensureParentDirectory()
         let lock = HandoffDirectoryLock(url: self.lockURL)
         try lock.acquire()
@@ -677,7 +677,7 @@ struct PiAuthStore: Sendable {
         try lock.checkOwnership()
 
         let initialInfo = try AppOwnedPathSafety.info(at: self.authURL)
-        if !initialInfo.exists {
+        if !initialInfo.exists && createIfMissing {
             try SecureAtomicCredentialFile.createIfMissing(
                 data: Data("{}\n".utf8),
                 at: self.authURL,
@@ -685,9 +685,9 @@ struct PiAuthStore: Sendable {
             try lock.checkOwnership()
         }
 
-        try self.secureAuthFile()
+        if initialInfo.exists || createIfMissing { try self.secureAuthFile() }
         try lock.checkOwnership()
-        let raw = try Data(contentsOf: self.authURL)
+        let raw = initialInfo.exists || createIfMissing ? try Data(contentsOf: self.authURL) : Data("{}\n".utf8)
         guard raw.count <= 1_000_000 else {
             throw PiCodexCredentialHandoffError.piAuthMalformed("the file is too large")
         }
@@ -727,7 +727,9 @@ struct PiAuthStore: Sendable {
     }
 
     func currentOAuthAccountID() throws -> String? {
-        try self.withLockedDocument { document, _ in
+        // Native-only installations must not acquire/create Pi credentials merely to inspect identity.
+        guard try AppOwnedPathSafety.info(at: self.authURL).exists else { return nil }
+        return try self.withLockedDocument(createIfMissing: false) { document, _ in
             guard let credentialObject = document.credentialObject else { return nil }
             return try PiCodexCredentialCodec.piCredential(from: credentialObject).accountID
         }
@@ -910,6 +912,39 @@ struct PiCodexCredentialHandoff: Sendable {
                 "the configuration marker does not match either side of the interrupted transaction")
         }
         try appLock.checkOwnership()
+    }
+
+    /// Explicit recovery after an external login. Relinquish only our stale ownership marker;
+    /// never copy, delete, or replace Pi/native credentials, and never discard a recovery journal.
+    func forgetStaleHandoff(
+        config: AppConfig,
+        saveConfig: @Sendable (AppConfig) -> Bool) throws -> AppConfig
+    {
+        guard let previousID = config.codexPiHandoffAccountID,
+              let profile = config.codexManagedAccounts.first(where: { $0.id == previousID }),
+              let expectedID = Self.normalizedAccountID(profile.accountID) else {
+            throw PiCodexCredentialHandoffError.handoffStateInvalid("the recorded handoff has no verified account identity")
+        }
+        try self.prepareJournalRoot()
+        let appLock = HandoffDirectoryLock(url: self.journalRoot.appendingPathComponent("codex-pi-handoff.lock", isDirectory: true))
+        try appLock.acquire()
+        defer { appLock.release() }
+        try appLock.checkOwnership()
+        guard !(try AppOwnedPathSafety.info(at: self.journalURL)).exists else {
+            throw PiCodexCredentialHandoffError.recoveryRequired("finish the recorded handoff transaction before clearing its association")
+        }
+        return try self.piAuthStore.withLockedDocument(createIfMissing: false) { document, piLock in
+            try self.checkOwnership(appLock: appLock, piLock: piLock)
+            let current = try self.readPiCredential(document)
+            guard current?.accountID != expectedID else {
+                throw PiCodexCredentialHandoffError.handoffStateInvalid("Pi still uses the recorded account; its handoff is not stale")
+            }
+            var next = config
+            next.codexPiHandoffAccountID = nil
+            try self.checkOwnership(appLock: appLock, piLock: piLock)
+            guard saveConfig(next) else { throw PiCodexCredentialHandoffError.configSaveFailed }
+            return next
+        }
     }
 
     func activate(

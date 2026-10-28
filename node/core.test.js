@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { classifyWindows, consumeCredit, diagnose, fetchAllManagedUsage, fetchUsage, makeUsage } from "./core.js";
+import { spawnSync } from "node:child_process";
+import { classifyWindows, consumeCredit, diagnose, fetchAllManagedUsage, fetchUsage, makeUsage, readPiIdentity } from "./core.js";
 import { parseArgs } from "./cli.js";
 
 test("classifies duration windows and preserves primary/secondary fallback", () => {
@@ -63,7 +64,10 @@ exec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)} "$@"
   const previous = process.env.LLM_BAR_CODEX_PATH;
   process.env.LLM_BAR_CODEX_PATH = executable;
   try {
-    const output = await fetchUsage({ codexHome: path.join(root, "managed-home"), timeoutMs: 2_000 });
+    const managedHome = path.join(root, "managed-home");
+    fs.mkdirSync(managedHome);
+    fs.writeFileSync(path.join(managedHome, "auth.json"), JSON.stringify({ tokens: { access_token: "fixture", refresh_token: "fixture", account_id: "managed-account" } }));
+    const output = await fetchUsage({ codexHome: managedHome, timeoutMs: 2_000 });
     assert.equal(output.codex.source, "Managed Codex");
     assert.equal(output.codex.email, "managed@example.com");
     assert.equal(output.codex.session.remainingPercent, 90);
@@ -144,6 +148,12 @@ exec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)}
   process.env.LLM_BAR_CODEX_PATH = executable;
   process.env.LLM_BAR_PI_AUTH_PATH = path.join(root, "missing-pi-auth.json");
   try {
+    const homesRoot = path.join(root, "codex-accounts");
+    for (const accountID of [first, second]) {
+      const home = path.join(homesRoot, accountID);
+      fs.mkdirSync(home, { recursive: true });
+      fs.writeFileSync(path.join(home, "auth.json"), JSON.stringify({ tokens: { access_token: "fixture", refresh_token: "fixture", account_id: accountID } }));
+    }
     const selected = await fetchAllManagedUsage({ configPath, authPath: process.env.LLM_BAR_PI_AUTH_PATH, timeoutMs: 2_000 });
     assert.equal(selected.codex.source, "Managed Codex");
     assert.equal(selected.codexAccounts.find(account => account.id === second)?.usage?.source, "Managed Codex");
@@ -182,6 +192,94 @@ exec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)}
     else process.env.LLM_BAR_PI_AUTH_PATH = previousPiAuth;
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("all-managed routes Pi by current identity, keeps stale handoff errors explicit, and never falls back primary", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "llm-usage-node-pi-routing-test-"));
+  const executable = path.join(root, "fake-codex.sh");
+  const script = path.join(root, "fake-codex.mjs");
+  const calls = path.join(root, "calls.log");
+  fs.writeFileSync(script, `import readline from "node:readline";
+import fs from "node:fs";
+fs.appendFileSync(${JSON.stringify(calls)}, (process.env.CODEX_HOME || "PI") + "\\n");
+const lines = readline.createInterface({ input: process.stdin });
+lines.on("line", line => {
+  const message = JSON.parse(line);
+  if (message.id == null) return;
+  let result = {};
+  if (message.method === "account/read") result = { account: { email: "managed@example.com" } };
+  if (message.method === "account/rateLimits/read") result = { rateLimits: { primary: { usedPercent: 10, windowDurationMins: 300 } } };
+  process.stdout.write(JSON.stringify({ id: message.id, result }) + "\\n");
+});
+`);
+  fs.writeFileSync(executable, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)}\n`);
+  fs.chmodSync(executable, 0o700);
+  const a = "11111111-1111-4111-8111-111111111111";
+  const b = "22222222-2222-4222-8222-222222222222";
+  const configPath = path.join(root, "config.json");
+  const authPath = path.join(root, "pi-auth.json");
+  const payload = Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: b } })).toString("base64url");
+  fs.writeFileSync(authPath, JSON.stringify({ "openai-codex": { type: "oauth", access: `header.${payload}.signature`, refresh: "fixture", expires: Date.now() + 60_000, accountId: b } }));
+  const oldExecutable = process.env.LLM_BAR_CODEX_PATH;
+  process.env.LLM_BAR_CODEX_PATH = executable;
+  try {
+    fs.writeFileSync(configPath, JSON.stringify({
+      codexManagedAccounts: [{ id: a, accountID: a }, { id: b, accountID: b }],
+      codexPiHandoffAccountID: a, codexPrimaryAccountID: a
+    }));
+    const switched = await fetchAllManagedUsage({ configPath, authPath, timeoutMs: 2_000 });
+    assert.equal(switched.codex, null);
+    assert.match(switched.codexAccounts.find(x => x.id === a).error, /changed outside this app/);
+    assert.equal(switched.codexAccounts.find(x => x.id === b).usage.source, "Pi auth");
+    const recordedCalls = fs.readFileSync(calls, "utf8").trim().split("\\n");
+    assert.equal(recordedCalls.length, 1);
+    assert.equal(recordedCalls[0], "PI");
+
+    fs.writeFileSync(configPath, JSON.stringify({
+      codexManagedAccounts: [{ id: a, accountID: a }, { id: b, accountID: b }],
+      codexPiHandoffAccountID: a, codexPrimaryAccountID: b
+    }));
+    const selectedB = await fetchAllManagedUsage({ configPath, authPath, timeoutMs: 2_000 });
+    assert.equal(selectedB.codex.source, "Pi auth");
+  } finally {
+    if (oldExecutable === undefined) delete process.env.LLM_BAR_CODEX_PATH;
+    else process.env.LLM_BAR_CODEX_PATH = oldExecutable;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("default Pi identity inspection does not create the configured auth path", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "llm-usage-node-pi-default-identity-test-"));
+  const agentDir = path.join(root, "missing", "agent");
+  try {
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+      import assert from "node:assert/strict";
+      const { getAgentDir } = await import("@mariozechner/pi-coding-agent");
+      assert.equal(getAgentDir(), process.env.PI_CODING_AGENT_DIR);
+      const { readPiIdentity } = await import("./node/core.js");
+      assert.equal(readPiIdentity(), null);
+    `], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: { ...process.env, PI_CODING_AGENT_DIR: agentDir }
+    });
+    assert.equal(child.status, 0, child.stderr || child.stdout);
+    assert.equal(fs.existsSync(path.dirname(agentDir)), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Pi identity inspection is read-only and rejects malformed or conflicting identity", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "llm-usage-node-pi-identity-test-"));
+  const authPath = path.join(root, "auth.json");
+  try {
+    fs.writeFileSync(authPath, JSON.stringify({ "openai-codex": { type: "oauth", access: "not-a-jwt", refresh: "fixture", accountId: "declared" } }));
+    assert.equal(readPiIdentity(authPath), "declared");
+    fs.writeFileSync(authPath, JSON.stringify({ "openai-codex": { type: "oauth", access: "not-a-jwt", refresh: "fixture" } }));
+    assert.throws(() => readPiIdentity(authPath), /credential is incomplete/);
+    const payload = Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "token-id" } })).toString("base64url");
+    fs.writeFileSync(authPath, JSON.stringify({ "openai-codex": { type: "oauth", access: `header.${payload}.signature`, refresh: "fixture", accountId: "declared-id" } }));
+    assert.throws(() => readPiIdentity(authPath), /does not match its access token/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test("reset consumption validates the expected account before the irreversible RPC", async () => {
@@ -378,6 +476,9 @@ exec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)}
 
 test("parses managed Codex home without changing the compatibility command", () => {
   assert.deepEqual(parseArgs(["codex", "--json"]), { command: "codex", json: true });
+  assert.deepEqual(parseArgs(["codex", "--expected-account-id", "account-1"]), { command: "codex", json: false, expectedChatgptAccountId: "account-1" });
+  assert.throws(() => parseArgs(["codex", "--expected-account-id", "account-1", "--all-managed"]), /only supported for a single Pi-auth query/);
+  assert.throws(() => parseArgs(["codex", "--codex-home", "/tmp/account", "--expected-account-id", "account-1"]), /only supported for a single Pi-auth query/);
   assert.deepEqual(parseArgs(["codex", "--all-managed", "--json"]), { command: "codex", allManaged: true, json: true });
   assert.deepEqual(parseArgs(["codex", "--codex-home", "/tmp/account", "--json"]), { command: "codex", codexHome: "/tmp/account", json: true });
   assert.deepEqual(parseArgs(["codex", "reset", "consume", "--credit-id", "c", "--idempotency-key", "k", "--expected-account-id", "chatgpt-account", "--json"]), { command: "consume", creditId: "c", idempotencyKey: "k", expectedChatgptAccountId: "chatgpt-account", json: true });

@@ -17,6 +17,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var refreshTask: Task<Void, Never>?
     private var managedLoginTask: Task<Void, Never>?
+    private var claudeLoginTask: Task<Void, Never>?
     private var piHandoffTask: Task<Void, Never>?
     private var state: AppState!
 
@@ -49,6 +50,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         self.refreshTask?.cancel()
         self.managedLoginTask?.cancel()
+        self.claudeLoginTask?.cancel()
         self.piHandoffTask?.cancel()
     }
 
@@ -218,6 +220,10 @@ final class AppController: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
         self.addCodexSection(to: menu, snapshot: snapshot)
+        if self.state.currentConfig.claudeEnabled {
+            menu.addItem(.separator())
+            self.addClaudeSection(to: menu, snapshot: snapshot)
+        }
 
         // OpenCode Go collection and settings remain available, but its menu section is hidden until it is needed again.
         menu.addItem(.separator())
@@ -257,7 +263,18 @@ final class AppController: NSObject, NSApplicationDelegate {
         let header = NSMenuItem(title: "Codex accounts", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
-        menu.addItem(self.disabledItem("Pi handoff: \(self.state.piHandoffStatus)"))
+        let recordedHandoffLabel = self.state.piHandoffAccountID.flatMap { id in
+            self.state.managedCodexAccounts.first(where: { $0.id == id })?.label
+        }
+        menu.addItem(self.disabledItem(self.state.isPiHandoffOutOfSync
+            ? "Pi handoff out of sync — recorded \(recordedHandoffLabel ?? "unknown") is not confirmed active."
+            : "Pi handoff: \(self.state.piHandoffStatus)"))
+        if self.state.isPiHandoffOutOfSync {
+            let recover = NSMenuItem(title: "Clear stale Pi handoff…", action: #selector(self.forgetStalePiHandoff), keyEquivalent: "")
+            recover.target = self
+            recover.isEnabled = self.piHandoffTask == nil
+            menu.addItem(recover)
+        }
 
         var accounts = snapshot.codexAccounts
         if accounts.isEmpty {
@@ -320,6 +337,15 @@ final class AppController: NSObject, NSApplicationDelegate {
         weekly.isEnabled = false
         menu.addItem(weekly)
 
+        let pendingCreditID = self.state.pendingCodexResetCreditID(for: account.id)
+        if let pendingCreditID {
+            let retry = NSMenuItem(title: "Retry pending saved reset…", action: #selector(self.useSavedReset), keyEquivalent: "")
+            retry.target = self
+            retry.representedObject = CodexResetSelection(accountID: account.id, creditID: pendingCreditID)
+            retry.isEnabled = self.state.canRedeemCodexReset(accountID: account.id, creditID: pendingCreditID)
+            menu.addItem(retry)
+        }
+
         if let resetCredits = codex.resetCredits {
             let title = resetCredits.availableCount == 1
                 ? "Saved resets: 1 available"
@@ -327,7 +353,9 @@ final class AppController: NSObject, NSApplicationDelegate {
             let resetItem = NSMenuItem(title: title, action: nil, keyEquivalent: "")
             let resetMenu = NSMenu(title: "Saved resets")
 
-            if resetCredits.availableCount == 0 {
+            if pendingCreditID != nil {
+                resetMenu.addItem(self.disabledItem("Resolve the pending request before choosing another reset."))
+            } else if resetCredits.availableCount == 0 {
                 resetMenu.addItem(self.disabledItem("No saved resets"))
             } else if resetCredits.credits.isEmpty {
                 resetMenu.addItem(self.disabledItem("Details unavailable; redemption is disabled to avoid spending an unspecified reset."))
@@ -361,6 +389,10 @@ final class AppController: NSObject, NSApplicationDelegate {
               self.state.managedCodexAccounts.contains(where: { $0.id == id })
         else { return }
 
+        if self.state.isPiHandoffOutOfSync && self.state.piHandoffAccountID == id {
+            menu.addItem(self.disabledItem("Recorded handoff: \(self.state.managedCodexAccounts.first(where: { $0.id == id })?.label ?? "unknown") (not confirmed active)"))
+            return
+        }
         if self.state.piHandoffAccountID == id {
             menu.addItem(self.disabledItem("✓ Active in Pi"))
             let release = NSMenuItem(
@@ -369,7 +401,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                 keyEquivalent: "")
             release.target = self
             release.representedObject = id
-            release.isEnabled = !self.state.isCodexAccountOperationInProgress
+            release.isEnabled = !self.state.isCodexAccountOperationInProgress && !self.state.isPiHandoffOutOfSync
             menu.addItem(release)
         } else {
             let isAlreadyActive = self.state.activePiCodexAccountID == id
@@ -382,8 +414,67 @@ final class AppController: NSObject, NSApplicationDelegate {
                 keyEquivalent: "")
             useInPi.target = self
             useInPi.representedObject = id
-            useInPi.isEnabled = !self.state.isCodexAccountOperationInProgress
+            useInPi.isEnabled = !self.state.isCodexAccountOperationInProgress && !self.state.isPiHandoffOutOfSync
             menu.addItem(useInPi)
+        }
+    }
+
+    private func addClaudeSection(to menu: NSMenu, snapshot: AppSnapshot) {
+        menu.addItem(self.disabledItem("Claude accounts"))
+        let accounts = snapshot.claudeAccounts
+        guard !accounts.isEmpty else {
+            menu.addItem(self.disabledItem("No Claude accounts tracked. Add one in Settings."))
+            return
+        }
+        for account in accounts {
+            menu.addItem(.separator())
+            let email = account.quota?.email ?? self.state.claudeAccounts.first(where: { $0.id == account.id })?.email
+            menu.addItem(self.disabledItem(email.map { "\(account.label) — \($0)" } ?? account.label))
+            if let quota = account.quota {
+                if let fiveHour = quota.fiveHour {
+                    menu.addItem(self.disabledItem("5h remaining: \(Formatting.percent(fiveHour.remainingPercent)) (resets in \(Formatting.relativeReset(fiveHour.resetAt)))"))
+                }
+                if let weekly = quota.weekly {
+                    menu.addItem(self.disabledItem("Weekly remaining: \(Formatting.percent(weekly.remainingPercent)) (resets in \(Formatting.relativeReset(weekly.resetAt)))"))
+                }
+                for model in quota.modelWindows {
+                    menu.addItem(self.disabledItem("\(model.title) weekly: \(Formatting.percent(model.window.remainingPercent)) remaining (resets in \(Formatting.relativeReset(model.window.resetAt)))"))
+                }
+                if let extra = quota.extraUsage, let spend = extra.usedUSD {
+                    let cap = extra.limitUSD.map(Formatting.currency) ?? "limit unavailable"
+                    menu.addItem(self.disabledItem("Extra usage: \(Formatting.currency(spend)) / \(cap)"))
+                }
+            } else if let error = account.quotaError {
+                menu.addItem(self.disabledItem("Quota unavailable: \(self.truncated(error, limit: 100))"))
+            } else {
+                menu.addItem(self.disabledItem("Quota unavailable"))
+            }
+            if let error = account.quotaError, account.quota != nil {
+                menu.addItem(self.disabledItem("Quota unavailable: \(self.truncated(error, limit: 100))"))
+            }
+            if let localError = account.localError {
+                menu.addItem(self.disabledItem("Local usage unavailable: \(self.truncated(localError, limit: 100))"))
+            }
+            if let local = account.localUsage, local.fileCount == 0 {
+                menu.addItem(self.disabledItem("No local sessions yet."))
+            } else if let local = account.localUsage {
+                let now = Date()
+                for (title, interval) in [("Today", Calendar.current.startOfDay(for: now)), ("7d", now.addingTimeInterval(-7 * 24 * 60 * 60)), ("30d", now.addingTimeInterval(-30 * 24 * 60 * 60))] {
+                    let summary = ClaudeTokenSummary.aggregate(rows: local.rows, since: interval, now: now)
+                    let item = NSMenuItem(title: "Local tokens — \(title): \(Formatting.compactNumber(summary.totalTokens))", action: nil, keyEquivalent: "")
+                    let details = NSMenu(title: title)
+                    details.addItem(self.disabledItem("Input: \(Formatting.compactNumber(summary.inputTokens))"))
+                    details.addItem(self.disabledItem("Output: \(Formatting.compactNumber(summary.outputTokens))"))
+                    details.addItem(self.disabledItem("Cache read: \(Formatting.compactNumber(summary.cacheReadTokens))"))
+                    details.addItem(self.disabledItem("Cache write: \(Formatting.compactNumber(summary.cacheWriteTokens))"))
+                    item.submenu = details
+                    menu.addItem(item)
+                }
+                if local.unreadableFileCount > 0 {
+                    menu.addItem(self.disabledItem("Partial logs: \(local.unreadableFileCount) unreadable file(s)."))
+                }
+                menu.addItem(self.disabledItem("Profile history only; may include prior logins."))
+            }
         }
     }
 
@@ -602,31 +693,31 @@ final class AppController: NSObject, NSApplicationDelegate {
             select.isEnabled = !self.state.isCodexAccountOperationInProgress
             accountMenu.addItem(select)
 
-            let piIsActive = self.state.piHandoffAccountID == profile.id
-            if piIsActive {
+            let piIsActive = self.state.activePiCodexAccountID == profile.id
+            if piIsActive && self.state.piHandoffAccountID == profile.id {
                 let release = NSMenuItem(title: "Stop using this account in Pi…", action: #selector(self.releaseManagedCodexAccountFromPi(_:)), keyEquivalent: "")
                 release.target = self
                 release.representedObject = profile.id
-                release.isEnabled = !self.state.isCodexAccountOperationInProgress
+                release.isEnabled = !self.state.isCodexAccountOperationInProgress && !self.state.isPiHandoffOutOfSync
                 accountMenu.addItem(release)
             } else {
-                let useInPi = NSMenuItem(title: "Use this account in Pi…", action: #selector(self.useManagedCodexAccountInPi(_:)), keyEquivalent: "")
+                let useInPi = NSMenuItem(title: piIsActive ? "Manage this active Pi account…" : "Use this account in Pi…", action: #selector(self.useManagedCodexAccountInPi(_:)), keyEquivalent: "")
                 useInPi.target = self
                 useInPi.representedObject = profile.id
-                useInPi.isEnabled = !self.state.isCodexAccountOperationInProgress
+                useInPi.isEnabled = !self.state.isCodexAccountOperationInProgress && !self.state.isPiHandoffOutOfSync
                 accountMenu.addItem(useInPi)
             }
 
             let reauthenticate = NSMenuItem(title: "Sign in again…", action: #selector(self.reauthenticateManagedCodexAccount(_:)), keyEquivalent: "")
             reauthenticate.target = self
             reauthenticate.representedObject = profile.id
-            reauthenticate.isEnabled = !self.state.isCodexAccountOperationInProgress && !piIsActive
+            reauthenticate.isEnabled = !self.state.isCodexAccountOperationInProgress && !piIsActive && !self.state.isPiHandoffOutOfSync
             accountMenu.addItem(reauthenticate)
 
             let remove = NSMenuItem(title: "Remove account…", action: #selector(self.removeManagedCodexAccount(_:)), keyEquivalent: "")
             remove.target = self
             remove.representedObject = profile.id
-            remove.isEnabled = !self.state.isCodexAccountOperationInProgress && !piIsActive
+            remove.isEnabled = !self.state.isCodexAccountOperationInProgress && !piIsActive && !self.state.isPiHandoffOutOfSync
             accountMenu.addItem(remove)
 
             accountItem.submenu = accountMenu
@@ -636,6 +727,54 @@ final class AppController: NSObject, NSApplicationDelegate {
         settingsMenu.addItem(managedAccountsItem)
 
         // OpenCode Go settings remain implemented but are intentionally hidden until needed again.
+        let claudeToggle = NSMenuItem(title: "Enable Claude", action: #selector(self.toggleClaudeEnabled), keyEquivalent: "")
+        claudeToggle.target = self
+        claudeToggle.state = config.claudeEnabled ? .on : .off
+        settingsMenu.addItem(claudeToggle)
+
+        let claudeAccountsItem = NSMenuItem(title: "Claude accounts", action: nil, keyEquivalent: "")
+        let claudeAccountsMenu = NSMenu(title: "Claude accounts")
+        for (title, action) in [("Add Claude account…", #selector(self.addClaudeAccount)), ("Track default Claude Code login…", #selector(self.trackDefaultClaudeAccount)), ("Track existing Claude profile…", #selector(self.trackExistingClaudeAccount))] {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.isEnabled = config.claudeEnabled && self.claudeLoginTask == nil && !self.state.isCodexAccountOperationInProgress
+            claudeAccountsMenu.addItem(item)
+        }
+        if self.claudeLoginTask != nil {
+            let cancel = NSMenuItem(title: "Cancel sign-in", action: #selector(self.cancelClaudeLogin), keyEquivalent: "")
+            cancel.target = self
+            claudeAccountsMenu.addItem(cancel)
+        }
+        claudeAccountsMenu.addItem(.separator())
+        for profile in self.state.claudeAccounts {
+            let accountItem = NSMenuItem(title: profile.email.map { "\(profile.label) — \($0)" } ?? profile.label, action: nil, keyEquivalent: "")
+            let accountMenu = NSMenu(title: profile.label)
+            let signIn = NSMenuItem(title: "Sign in…", action: #selector(self.authenticateClaudeAccount(_:)), keyEquivalent: "")
+            signIn.target = self
+            signIn.representedObject = profile.id
+            signIn.isEnabled = !self.state.isCodexAccountOperationInProgress && self.claudeLoginTask == nil
+            accountMenu.addItem(signIn)
+            let refresh = NSMenuItem(title: "Refresh / allow Keychain access…", action: #selector(self.refreshClaudeAccount(_:)), keyEquivalent: "")
+            refresh.target = self
+            refresh.representedObject = profile.id
+            refresh.isEnabled = !self.state.isCodexAccountOperationInProgress && self.claudeLoginTask == nil
+            accountMenu.addItem(refresh)
+            let command = NSMenuItem(title: "Copy Claude Code launch command", action: #selector(self.copyClaudeLaunchCommand(_:)), keyEquivalent: "")
+            command.target = self
+            command.representedObject = profile.id
+            accountMenu.addItem(command)
+            let remove = NSMenuItem(title: "Remove from tracking…", action: #selector(self.removeClaudeAccount(_:)), keyEquivalent: "")
+            remove.target = self
+            remove.representedObject = profile.id
+            remove.isEnabled = !self.state.isCodexAccountOperationInProgress && self.claudeLoginTask == nil
+            accountMenu.addItem(remove)
+            accountItem.submenu = accountMenu
+            claudeAccountsMenu.addItem(accountItem)
+        }
+        claudeAccountsItem.submenu = claudeAccountsMenu
+        claudeAccountsItem.isEnabled = config.claudeEnabled
+        settingsMenu.addItem(claudeAccountsItem)
+
         let piToggle = NSMenuItem(title: "Enable Pi", action: #selector(self.togglePiEnabled), keyEquivalent: "")
         piToggle.target = self
         piToggle.state = config.piEnabled ? .on : .off
@@ -839,23 +978,28 @@ final class AppController: NSObject, NSApplicationDelegate {
     @objc private func useSavedReset(_ sender: NSMenuItem) {
         guard let selection = sender.representedObject as? CodexResetSelection,
               let account = self.state.snapshot.codexAccounts.first(where: { $0.id == selection.accountID }),
-              let resetCredits = account.usage?.resetCredits,
-              resetCredits.availableCount > 0,
-              let selectedCredit = resetCredits.credits.first(where: { $0.id == selection.creditID })
+              let usage = account.usage
+        else { return }
+        let isRetry = self.state.pendingCodexResetCreditID(for: account.id) == selection.creditID
+        let selectedCredit = usage.resetCredits?.credits.first(where: { $0.id == selection.creditID })
+        guard self.state.canRedeemCodexReset(accountID: account.id, creditID: selection.creditID),
+              isRetry || ((usage.resetCredits?.availableCount ?? 0) > 0 && selectedCredit?.status?.lowercased() == "available")
         else {
             self.showAlert(title: "Saved reset is no longer available", message: "Refresh the selected Codex account and choose a current reset.", style: .warning)
             return
         }
 
-        let label = selectedCredit.title ?? selectedCredit.description ?? "the selected saved reset"
-        let expiry = " It expires \(Formatting.dateTime(selectedCredit.expiresAt))."
+        let label = selectedCredit?.title ?? selectedCredit?.description ?? "the selected saved reset"
+        let expiry = " It expires \(Formatting.dateTime(selectedCredit?.expiresAt))."
 
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "Use saved Codex reset?"
-        alert.informativeText = "This will spend one saved reset on the selected Codex account. This cannot be undone.\n\nAccount: \(account.displayLabel)\nSelected: \(label).\(expiry)"
+        alert.messageText = isRetry ? "Retry pending Codex reset?" : "Use saved Codex reset?"
+        alert.informativeText = isRetry
+            ? "This retries the original request with the same account, saved reset, and idempotency key. If it already succeeded, no additional reset will be spent.\n\nAccount: \(account.displayLabel)"
+            : "This will spend one saved reset on the selected Codex account. This cannot be undone.\n\nAccount: \(account.displayLabel)\nSelected: \(label).\(expiry)"
         alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Use reset")
+        alert.addButton(withTitle: isRetry ? "Retry request" : "Use reset")
         NSRunningApplication.current.activate()
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertSecondButtonReturn else { return }
@@ -1075,6 +1219,127 @@ final class AppController: NSObject, NSApplicationDelegate {
             }
             self.managedLoginTask = nil
             self.rebuildMenu()
+        }
+    }
+
+    @objc private func toggleClaudeEnabled() {
+        self.applyConfigMutation { $0.claudeEnabled.toggle() }
+    }
+
+    @objc private func addClaudeAccount() {
+        guard let label = self.promptForValue(title: "Add Claude account", message: "Create an isolated app-owned Claude profile, then sign in.", defaultValue: "Claude account \(self.state.claudeAccounts.count + 1)", placeholder: "Personal, work, …") else { return }
+        do {
+            let profile = try self.state.createClaudeAccount(label: label)
+            self.startClaudeLogin(accountID: profile.id)
+        } catch { self.showAlert(title: "Could not add Claude account", message: error.localizedDescription, style: .warning) }
+    }
+
+    @objc private func trackDefaultClaudeAccount() {
+        guard let label = self.promptForValue(title: "Track default Claude Code login", message: "Track the existing default Claude Code login without replacing it. Credentials are not copied.", defaultValue: "Claude account", placeholder: "Personal, work, …") else { return }
+        do {
+            let profile = try self.state.addClaudeAccount(label: label, configDirectory: nil)
+            self.rebuildMenu()
+            Task { await self.state.refreshClaudeAccount(id: profile.id, allowKeychainPrompt: true); self.rebuildMenu() }
+        }
+        catch { self.showAlert(title: "Could not track Claude account", message: error.localizedDescription, style: .warning) }
+    }
+
+    @objc private func trackExistingClaudeAccount() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose an existing Claude profile directory"
+        guard panel.runModal() == .OK, let url = panel.url,
+              let label = self.promptForValue(title: "Track existing Claude profile", message: "Credentials remain in this existing profile.", defaultValue: url.lastPathComponent, placeholder: "Work") else { return }
+        do {
+            let profile = try self.state.addClaudeAccount(label: label, configDirectory: url.path)
+            self.rebuildMenu()
+            Task { await self.state.refreshClaudeAccount(id: profile.id, allowKeychainPrompt: true); self.rebuildMenu() }
+        }
+        catch { self.showAlert(title: "Could not track Claude profile", message: error.localizedDescription, style: .warning) }
+    }
+
+    @objc private func authenticateClaudeAccount(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let profile = self.state.claudeAccounts.first(where: { $0.id == id }) else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Sign in to \(profile.label)?"
+        alert.informativeText = profile.configDirectory == nil
+            ? "This will replace the existing default Claude Code login. The default profile is shared outside this app."
+            : "This sign-in is scoped to the selected Claude profile."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Sign in")
+        NSRunningApplication.current.activate(); NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        self.startClaudeLogin(accountID: id)
+    }
+
+    private func startClaudeLogin(accountID: UUID) {
+        guard self.claudeLoginTask == nil else { return }
+        self.claudeLoginTask = Task { [weak self] in
+            guard let self else { return }
+            do { try await self.state.authenticateClaudeAccount(id: accountID) }
+            catch is CancellationError { /* Explicit cancellation is not a sign-in failure. */ }
+            catch { self.showAlert(title: "Claude sign-in failed", message: "The profile remains tracked so you can retry. \(error.localizedDescription)", style: .warning) }
+            self.claudeLoginTask = nil
+            self.rebuildMenu()
+        }
+        self.rebuildMenu()
+    }
+
+    @objc private func cancelClaudeLogin() { self.claudeLoginTask?.cancel() }
+
+    @objc private func copyClaudeLaunchCommand(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let profile = self.state.claudeAccounts.first(where: { $0.id == id }) else { return }
+        let command: String
+        if profile.configDirectory != nil {
+            let path = profile.directoryURL.path.replacingOccurrences(of: "'", with: "'\\''")
+            command = "CLAUDE_CONFIG_DIR='\(path)' claude"
+        } else {
+            command = "env -u CLAUDE_CONFIG_DIR claude"
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(command, forType: .string)
+    }
+
+    @objc private func refreshClaudeAccount(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            await self.state.refreshClaudeAccount(id: id, allowKeychainPrompt: true)
+            self.rebuildMenu()
+        }
+    }
+
+    @objc private func removeClaudeAccount(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let profile = self.state.claudeAccounts.first(where: { $0.id == id }) else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Remove \(profile.label) from tracking?"
+        alert.informativeText = "Only tracking metadata will be removed. The Claude profile directory, logs, and credentials are retained."
+        alert.addButton(withTitle: "Cancel"); alert.addButton(withTitle: "Remove")
+        NSRunningApplication.current.activate(); NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        do { try self.state.removeClaudeAccount(id: id); self.rebuildMenu() }
+        catch { self.showAlert(title: "Could not remove Claude account", message: error.localizedDescription, style: .warning) }
+    }
+
+    @objc private func forgetStalePiHandoff() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Clear stale Pi handoff?"
+        alert.informativeText = "Only the recorded account association will be cleared; Pi credentials will not be touched. The old account may need to sign in again."
+        alert.addButton(withTitle: "Cancel"); alert.addButton(withTitle: "Clear association")
+        NSRunningApplication.current.activate(); NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do { try await self.state.forgetStalePiHandoff(); self.rebuildMenu() }
+            catch { self.showAlert(title: "Could not clear stale Pi handoff", message: error.localizedDescription, style: .warning) }
         }
     }
 

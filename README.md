@@ -1,8 +1,9 @@
-# LLM Usage Bar (Codex + OpenCode Go + Pi)
+# LLM Usage Bar (Codex + Claude + OpenCode Go + Pi)
 
 Small macOS menu bar app to track:
 
 - **Codex** usage (session + weekly + credits + saved rate-limit resets)
+- **Claude** multi-subscription usage (five-hour/weekly/model-specific allowances, reset times, and local Claude Code token totals)
 - **OpenCode Go** usage (5h/weekly/monthly + model usage history for GLM-5, Kimi K2.5, MiniMax M2.5)
 - **Pi** local session usage (today / last 7d / last 30d / last 90d, a selectable 90d/6m/1y/All token chart, and model/provider/project summaries)
 
@@ -89,6 +90,8 @@ Example:
 {
   "autoRedeemExpiringCodexResets" : false,
   "codexEnabled" : true,
+  "claudeEnabled" : true,
+  "claudeAccounts" : [],
   "codexManagedAccounts" : [],
   "codexPrimaryAccountID" : null,
   "codexPiHandoffAccountID" : null,
@@ -105,6 +108,8 @@ Example:
 ### Codex setup
 
 Codex rate limits and saved reset credits are fetched from the Codex app-server. When credits are available, each account section lists its expiry and offers an explicit, Cancel-by-default confirmation before spending one. The Settings menu can opt in to automatically redeem the specific earliest-expiring saved reset during its final hour, but auto-redemption is scoped to the explicitly selected menu-bar account and fails closed if that account is not current. It sends local notifications at 24 hours, 6 hours, and after the redemption attempt.
+
+Ownership and credential identity are rechecked before a reset attempt is recorded or dispatched. If a dispatched request has an uncertain result, **Retry pending saved reset…** reuses its original account, credit, and idempotency key—even if that credit is now redeemed, expired, or absent from the list. Other reset requests remain blocked until this retry confirms the outcome; a refresh alone never discards an uncertain attempt.
 
 With no managed accounts, the app displays a prompt to add one and does not fetch Codex usage.
 
@@ -125,6 +130,43 @@ Settings → Managed Codex accounts → **Use this account in Pi…** performs a
 Before switching, exit running Pi sessions. Resume or restart them after the confirmation so they reload the selected account. When switching to another managed account, LLM Usage Bar first saves the latest Pi access/refresh tokens back to the matching inactive managed home, then atomically activates the target. An existing Pi `openai-codex` credential for a different ChatGPT account is rejected rather than overwritten; unrelated provider entries are preserved. **Stop using this account in Pi…** moves the latest tokens back and removes the Pi entry.
 
 Handoff state and account identity metadata are recorded in `config.json`; credential files are restricted to the owning user (`0700` directories, `0600` files), protected by Pi's mkdir-lock protocol with an inode-checked heartbeat, validated for account identity, and written atomically. ConfigStore saves—including handoff commits—share a kernel-owned `config.json.lock` across the complete comparison and replacement; lock paths are never deleted as stale. An existing Pi lock is treated as busy, and any inode replacement aborts the transaction rather than being silently ignored. Exact credential and Pi snapshots are journaled for recovery; a changed Pi/config document, missing or corrupt rollback snapshot, or unsafe symlink causes the operation to fail closed and, once a journal exists, leaves it for recovery. After a committed or rolled-back invariant is proven, the journal is removed before best-effort deletion of nonessential backups, so a partial cleanup can leave only a protected orphan backup—not a journal referring to deleted recovery data.
+
+### External Pi login changes
+
+Usage tracking follows Pi's **verified current ChatGPT identity**, not just the last recorded handoff. If you manually change Pi's login, the matching known account is read from Pi; its duplicate native credential is not refreshed. An unknown, ambiguous, or unreadable identity is never guessed or attributed to a different account. The explicitly selected menu-bar account is not automatically changed.
+
+If the menu reports a stale handoff:
+
+1. Choose **Clear stale Pi handoff…** in the Codex section. This clears only the stale association; it does not copy, replace, or delete credentials.
+2. The displaced account may need **Settings → Managed Codex accounts → Sign in again…**, because its only live credential had been in Pi before the external login replaced it.
+3. To resume managed switching, choose **Manage this active Pi account…** for the account Pi actually uses. Exit Pi sessions before a credential handoff, as above.
+4. Select **Use for menu-bar glyph** if you want a different account displayed in the menu bar.
+
+Saved-reset spending is disabled while handoff ownership is inconsistent, and an observed-but-not-managed Pi account cannot spend resets through a stale native home. Inactive accounts with independent working credentials remain readable.
+
+### Claude setup and multiple subscriptions
+
+Use **Settings → Claude accounts**:
+
+- **Track default Claude Code login…** registers your existing default login without replacing it. macOS may ask for read-only Keychain access.
+- **Track existing Claude profile…** registers another directory already used with `CLAUDE_CONFIG_DIR`. Select the configuration directory itself, not its `projects` subdirectory.
+- **Add Claude account…** creates an isolated directory under `~/.llm-usage-bar/claude-accounts/<profile-id>/` and runs the installed `claude auth login --claudeai` for that directory. Sign in to the desired subscription in the browser. This does not switch your normal/default Claude Code login.
+
+Each tracked profile shows its available five-hour, weekly, and model-specific remaining percentages and reset times. Extra-usage spend and its reported cap are shown when available. Quota is fetched using that profile's OAuth credential through Claude's **undocumented/internal** usage and profile endpoints; these may change without notice. Missing windows stay unavailable rather than becoming synthetic 0% usage. One account's failure does not hide the others.
+
+Credentials remain owned by Claude Code, in the profile-specific macOS Keychain item or `.credentials.json`; LLM Usage stores only labels, directory paths, and verified account/organization identity metadata. Custom directories never fall back to the default account's Keychain entry. The unset/default profile is distinct from explicitly setting `CLAUDE_CONFIG_DIR=~/.claude`, even though both use the same log directory; a log directory can only be tracked once. Conflicting valid file/Keychain logins fail closed rather than silently choosing an old account. If a profile's authenticated account changes, remove and re-add its tracking entry to acknowledge the new identity.
+
+Background refreshes **never prompt for Keychain access**. Use a profile's **Refresh / allow Keychain access…** action to grant it explicitly. Denied/locked access remains an error, not a reason to silently use an unverified source. Tokens are never copied to a second credential store, and **LLM Usage does not refresh Claude OAuth tokens**. When access expires, open that same profile in Claude Code so Claude Code can refresh its login, or use **Sign in…**. Each account's settings menu offers **Copy Claude Code launch command**, for example:
+
+```bash
+CLAUDE_CONFIG_DIR="$HOME/.llm-usage-bar/claude-accounts/<profile-id>" claude
+```
+
+Shell API-key, OAuth-token, or cloud-provider overrides can take precedence over a profile when you run Claude Code yourself. LLM Usage's explicit sign-in subprocess removes those inherited overrides.
+
+Token totals are read locally from each profile's `projects/**/*.jsonl`, including subagent logs, with streamed/copied request-message identities deduplicated. The menu shows today/7d/30d totals, with input/output/cache-read/cache-write details. These are **recorded local-profile tokens**, not an account-wide total across devices or Claude web/desktop, and history from a directory used with past logins cannot be reliably attributed to one subscription. Profiles without a `projects` directory show “No local sessions yet”; unreadable existing history is reported separately from quota errors. No token count is inferred from an allowance percentage, and API-price estimates are not presented as subscription bills.
+
+Removing a Claude account from tracking deletes only its tracking metadata, never its directory, sessions, or credentials. Claude account switching is not implemented by this feature.
 
 Node must be discoverable from common paths, your login shell, or `LLM_BAR_NODE_PATH`.
 
@@ -176,6 +218,7 @@ If no manual cookie is configured, the fetcher also attempts a Chromium/Chrome c
 You can also run with env vars. These values affect the current process only: unrelated UI and managed-account saves preserve the corresponding values already stored on disk, including managed-account metadata.
 
 - `LLM_BAR_CODEX_PATH`
+- `LLM_BAR_CLAUDE_PATH` (Claude Code executable for explicit sign-in)
 - `LLM_BAR_NODE_PATH`
 - `LLM_BAR_OPENCODE_COOKIE`
 - `LLM_BAR_OPENCODE_WORKSPACE_ID`
@@ -201,3 +244,13 @@ swift run LLMUsageBar
 
 - OpenCode usage-history access currently relies on internal web server-function endpoints used by the OpenCode web UI.
 - Managed Codex accounts use the installed Codex CLI and app-server; LLM Usage Bar does not shell out to CodexBar.
+
+## Validation
+
+```bash
+swift test
+node --test node/*.test.js
+npm run build
+```
+
+Claude tests use fixture credentials, fake CLI processes, and injected HTTP responses; they never access real Keychain logins or make provider requests.

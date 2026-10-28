@@ -1,4 +1,4 @@
-import { AuthStorage } from "@mariozechner/pi-coding-agent";
+import { AuthStorage, getAgentDir } from "@mariozechner/pi-coding-agent";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import os from "node:os";
@@ -21,6 +21,24 @@ function jwtAccountId(token) {
     const id = JSON.parse(json)["https://api.openai.com/auth"]?.chatgpt_account_id;
     return typeof id === "string" && id ? id : null;
   } catch { return null; }
+}
+
+export function readPiIdentity(authPath) {
+  const effectiveAuthPath = authPath || path.join(getAgentDir(), "auth.json");
+  if (!lstatIfPresent(effectiveAuthPath)) return null;
+  const storage = AuthStorage.create(authPath || undefined);
+  if (storage.drainErrors().length) throw new Error("Pi credential storage could not be read safely.");
+  const credential = storage.get(PROVIDER);
+  if (!credential || credential.type !== "oauth") return null;
+  const accessToken = typeof credential.access === "string" ? credential.access : null;
+  const tokenAccountId = accessToken ? jwtAccountId(accessToken) : null;
+  const declaredAccountId = nonEmptyString(credential.accountId) ? credential.accountId.trim() : null;
+  if (declaredAccountId && tokenAccountId && declaredAccountId !== tokenAccountId) {
+    throw new Error("Pi Codex OAuth account identity does not match its access token.");
+  }
+  const accountId = declaredAccountId || tokenAccountId;
+  if (!accessToken || !accountId) throw new Error("Pi Codex OAuth credential is incomplete.");
+  return accountId;
 }
 
 export async function piTokens(authPath, expectedChatgptAccountId = null) {
@@ -371,7 +389,11 @@ function validateNativeAccountIdentity(accountResponse, rateLimitsResponse, expe
   }
 }
 
-async function fetchNativeUsage({ pathToCodex, codexHome, timeoutMs }) {
+async function fetchNativeUsage({ pathToCodex, codexHome, timeoutMs, expectedChatgptAccountId = null }) {
+  const credentialAccountId = validateNativeAuthFile(path.join(normalizeCodexHome(codexHome), "auth.json"));
+  if (expectedChatgptAccountId && credentialAccountId !== expectedChatgptAccountId) {
+    throw new Error(`Managed Codex credential belongs to a different ChatGPT account (expected ${expectedChatgptAccountId}, found ${credentialAccountId}).`);
+  }
   const home = secureManagedHome(codexHome);
   const rpc = new RPC(pathToCodex, { codexHome: home });
   try {
@@ -393,7 +415,7 @@ export async function fetchUsage({
 } = {}) {
   const pathToCodex = resolveCodex();
   if (!pathToCodex) throw new Error(`Codex executable not found. Checked: ${candidates().join(", ")}`);
-  if (codexHome != null) return fetchNativeUsage({ pathToCodex, codexHome, timeoutMs });
+  if (codexHome != null) return fetchNativeUsage({ pathToCodex, codexHome, timeoutMs, expectedChatgptAccountId });
 
   const initial = await piTokens(authPath, expectedChatgptAccountId);
   if (!initial) throw new Error("Pi-managed openai-codex OAuth is not available.");
@@ -444,26 +466,46 @@ export async function fetchAllManagedUsage({
 
   const configRoot = path.dirname(path.resolve(configPath));
   const homesRoot = path.join(configRoot, "codex-accounts");
+  const identities = new Map();
+  for (const profile of profiles) {
+    const id = typeof profile?.id === "string" ? profile.id : "";
+    const declared = nonEmptyString(profile?.accountID) ? profile.accountID.trim() : null;
+    if (declared) identities.set(id, { accountID: declared });
+    else if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
+      try { identities.set(id, { accountID: validateNativeAuthFile(path.join(homesRoot, id, "auth.json")) }); }
+      catch (error) { identities.set(id, { error: redactSensitive(error instanceof Error ? error.message : String(error)) }); }
+    }
+  }
   const accounts = [];
   for (const profile of profiles) {
     const id = typeof profile?.id === "string" ? profile.id : "";
     const label = typeof profile?.label === "string" && profile.label.trim() ? profile.label.trim() : "Managed Codex";
     const email = typeof profile?.email === "string" && profile.email.trim() ? profile.email.trim() : null;
-    const accountID = typeof profile?.accountID === "string" && profile.accountID.trim() ? profile.accountID.trim() : null;
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
       accounts.push({ id, label, email, usage: null, error: "Invalid managed account id." });
       continue;
     }
     try {
-      // An app handoff deliberately removes auth.json from the active managed home. Reuse Pi's
-      // locked auth path for that one profile; all inactive profiles stay native and isolated.
+      // Resolve Pi again immediately before each account operation; another process may have
+      // changed credentials while an earlier app-server request was awaiting a response.
+      let currentPiID;
+      try { currentPiID = readPiIdentity(authPath); }
+      catch { throw new Error("Pi account identity could not be verified; check Pi sign-in before refreshing managed accounts."); }
+      const matchSet = currentPiID ? profiles.filter(candidate => identities.get(candidate?.id)?.accountID === currentPiID) : [];
+      const routedID = matchSet.length === 1 ? matchSet[0]?.id : null;
+      const identity = identities.get(id);
+      if (identity?.error) throw new Error(identity.error);
       let usage;
-      if (id === piHandoffID) {
-        // Usage is read-only; use the supplied Pi path even for legacy profiles that predate
-        // accountID metadata. When metadata exists, validate it in the same Pi RPC setup.
-        usage = await fetchUsage({ authPath, expectedChatgptAccountId: accountID, timeoutMs });
+      if (id === routedID) {
+        usage = await fetchUsage({ authPath, expectedChatgptAccountId: currentPiID, timeoutMs });
+      } else if (id === piHandoffID && !identity?.accountID) {
+        throw new Error("This Pi handoff profile has no account identity metadata, so its Pi credentials cannot be safely attributed. Re-link the managed account.");
+      } else if (currentPiID && identity?.accountID === currentPiID && id !== routedID) {
+        throw new Error("Pi's current account matches multiple managed profiles; refusing to attribute usage or refresh a possible duplicate native credential.");
+      } else if (id === piHandoffID && (!currentPiID || currentPiID !== identity?.accountID)) {
+        throw new Error("Pi's openai-codex account changed outside this app; this profile no longer matches. Its managed credential may require sign-in.");
       } else {
-        usage = await fetchUsage({ codexHome: path.join(homesRoot, id), timeoutMs });
+        usage = await fetchUsage({ codexHome: path.join(homesRoot, id), timeoutMs, expectedChatgptAccountId: identity?.accountID ?? null });
       }
       accounts.push({ id, label, email: usage.codex.email ?? email, usage: usage.codex, error: null });
     } catch (error) {

@@ -23,7 +23,17 @@ function parseUsageOptions(args, start = 1) {
       if (values.allManaged) throw new Error("--all-managed cannot be combined with --codex-home");
       i = parseCodexHomeOption(args, i, values); continue;
     }
+    if (key === "--expected-account-id") {
+      if (values.expectedChatgptAccountId) throw new Error(`Duplicate argument: ${key}`);
+      const value = args[++i];
+      if (!value || value.startsWith("--")) throw new Error(`Missing value for ${key}`);
+      values.expectedChatgptAccountId = value;
+      continue;
+    }
     throw new Error(`Unknown argument: ${key}`);
+  }
+  if (values.expectedChatgptAccountId && (values.allManaged || values.codexHome)) {
+    throw new Error("Usage --expected-account-id is only supported for a single Pi-auth query");
   }
   return values;
 }
@@ -57,7 +67,7 @@ export function parseArgs(args) {
 }
 
 export function help() {
-  return "Usage: llm-usage codex [--json] [--codex-home PATH | --all-managed]\n       llm-usage codex reset consume --credit-id ID --idempotency-key KEY --expected-account-id ID [--codex-home PATH] --json\n       llm-usage diagnose [--json]\n       llm-usage help";
+  return "Usage: llm-usage codex [--json] [--codex-home PATH | --all-managed | --expected-account-id ID]\n       llm-usage codex reset consume --credit-id ID --idempotency-key KEY --expected-account-id ID [--codex-home PATH] --json\n       llm-usage diagnose [--json]\n       llm-usage help";
 }
 
 async function main(argv = process.argv.slice(2)) {

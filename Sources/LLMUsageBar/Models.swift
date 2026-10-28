@@ -298,6 +298,7 @@ struct PiSnapshot: Sendable {
 struct AppSnapshot: Sendable {
     let codex: CodexSnapshot?
     let codexAccounts: [CodexAccountSnapshot]
+    let claudeAccounts: [ClaudeAccountSnapshot]
     let openCode: OpenCodeSnapshot?
     let pi: PiSnapshot?
     let errors: [String]
@@ -306,6 +307,7 @@ struct AppSnapshot: Sendable {
     init(
         codex: CodexSnapshot?,
         codexAccounts: [CodexAccountSnapshot] = [],
+        claudeAccounts: [ClaudeAccountSnapshot] = [],
         openCode: OpenCodeSnapshot?,
         pi: PiSnapshot?,
         errors: [String],
@@ -313,6 +315,7 @@ struct AppSnapshot: Sendable {
     {
         self.codex = codex
         self.codexAccounts = codexAccounts
+        self.claudeAccounts = claudeAccounts
         self.openCode = openCode
         self.pi = pi
         self.errors = errors

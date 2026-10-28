@@ -19,6 +19,34 @@ private final class TestCounter: @unchecked Sendable {
 }
 
 final class CodexModelsTests: XCTestCase {
+    func testCodexCommandFailureExplainsManagedAuthentication() {
+        for stderr in ["Managed Codex account is not authenticated.", "Managed Codex auth.json is missing."] {
+            let error = CodexNodeBridge.commandFailure(stderr: stderr, exitStatus: 1)
+            XCTAssertEqual(
+                error.errorDescription,
+                "Not signed in. Use Settings → Managed Codex accounts → Sign in again…")
+        }
+    }
+
+    func testCodexCommandFailurePreservesDetailsAndDoesNotMisreportLaunchFailure() {
+        let error = CodexNodeBridge.commandFailure(
+            stderr: "Codex service unavailable",
+            exitStatus: 7)
+
+        XCTAssertEqual(error.errorDescription, "Bundled Codex CLI command failed: Codex service unavailable")
+    }
+
+    func testCodexCommandFailureUsesExitStatusWhenNoDetailsExist() {
+        let error = CodexNodeBridge.commandFailure(stderr: "", exitStatus: 9)
+
+        XCTAssertEqual(error.errorDescription, "Bundled Codex CLI command failed: exit status 9")
+    }
+
+    func testCodexLaunchFailureStillReportsLaunchProblem() {
+        let error = CodexNodeBridge.BridgeError.launchFailed("Permission denied")
+        XCTAssertEqual(error.errorDescription, "Could not start bundled Codex CLI: Permission denied")
+    }
+
     func testNodeDateDecodingSupportsFractionalAndStandardISO8601() {
         XCTAssertNotNil(CodexNodeBridge.iso8601Date(from: "2026-07-19T22:08:28.000Z"))
         XCTAssertNotNil(CodexNodeBridge.iso8601Date(from: "2026-07-19T22:08:28Z"))

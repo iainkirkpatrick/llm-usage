@@ -56,6 +56,8 @@ struct CodexManagedAccountProfile: Codable, Sendable, Equatable {
 struct AppConfig: Codable, Equatable, Sendable {
     var refreshIntervalSeconds: Int
     var codexEnabled: Bool
+    var claudeEnabled: Bool
+    var claudeAccounts: [ClaudeAccountProfile]
     var openCodeEnabled: Bool
     var openCodeWorkspaceID: String?
     var openCodeCookieHeader: String?
@@ -73,6 +75,8 @@ struct AppConfig: Codable, Equatable, Sendable {
     static let `default` = AppConfig(
         refreshIntervalSeconds: 300,
         codexEnabled: true,
+        claudeEnabled: true,
+        claudeAccounts: [],
         openCodeEnabled: true,
         openCodeWorkspaceID: nil,
         openCodeCookieHeader: nil,
@@ -88,6 +92,8 @@ struct AppConfig: Codable, Equatable, Sendable {
     init(
         refreshIntervalSeconds: Int,
         codexEnabled: Bool,
+        claudeEnabled: Bool = true,
+        claudeAccounts: [ClaudeAccountProfile] = [],
         openCodeEnabled: Bool,
         openCodeWorkspaceID: String?,
         openCodeCookieHeader: String?,
@@ -101,6 +107,8 @@ struct AppConfig: Codable, Equatable, Sendable {
     ) {
         self.refreshIntervalSeconds = refreshIntervalSeconds
         self.codexEnabled = codexEnabled
+        self.claudeEnabled = claudeEnabled
+        self.claudeAccounts = claudeAccounts
         self.openCodeEnabled = openCodeEnabled
         self.openCodeWorkspaceID = openCodeWorkspaceID
         self.piEnabled = piEnabled
@@ -116,6 +124,8 @@ struct AppConfig: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case refreshIntervalSeconds
         case codexEnabled
+        case claudeEnabled
+        case claudeAccounts
         case openCodeEnabled
         case openCodeWorkspaceID
         case openCodeCookieHeader
@@ -134,6 +144,8 @@ struct AppConfig: Codable, Equatable, Sendable {
 
         self.refreshIntervalSeconds = try container.decodeIfPresent(Int.self, forKey: .refreshIntervalSeconds) ?? defaults.refreshIntervalSeconds
         self.codexEnabled = try container.decodeIfPresent(Bool.self, forKey: .codexEnabled) ?? defaults.codexEnabled
+        self.claudeEnabled = try container.decodeIfPresent(Bool.self, forKey: .claudeEnabled) ?? defaults.claudeEnabled
+        self.claudeAccounts = try container.decodeIfPresent([ClaudeAccountProfile].self, forKey: .claudeAccounts) ?? defaults.claudeAccounts
         self.openCodeEnabled = try container.decodeIfPresent(Bool.self, forKey: .openCodeEnabled) ?? defaults.openCodeEnabled
         self.openCodeWorkspaceID = try container.decodeIfPresent(String.self, forKey: .openCodeWorkspaceID)
         self.openCodeCookieHeader = try container.decodeIfPresent(String.self, forKey: .openCodeCookieHeader)

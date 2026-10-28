@@ -249,24 +249,35 @@ private struct NodeCodexOutput: Decodable, Sendable {
 
 private struct NodeConsumeOutput: Decodable, Sendable { let outcome: String }
 
-struct CodexNodeBridge: Sendable {
+protocol CodexUsageFetching: Sendable {
+    func fetchPiAuth(expectedAccountID: String) async throws -> CodexSnapshot
+    func fetchManaged(codexHome: URL) async throws -> CodexSnapshot
+    func consumeResetCredit(
+        creditID: String,
+        idempotencyKey: String,
+        expectedChatGPTAccountID: String,
+        codexHome: URL?) async throws -> String
+}
+
+struct CodexNodeBridge: CodexUsageFetching {
     enum BridgeError: LocalizedError {
-        case nodeNotFound([String]), scriptNotFound, launchFailed(String), timedOut, malformed(String?)
+        case nodeNotFound([String]), scriptNotFound, launchFailed(String), commandFailed(String), timedOut, malformed(String?)
         var errorDescription: String? {
             switch self {
             case let .nodeNotFound(paths): return paths.isEmpty ? "Node.js executable was not found." : "Node.js executable was not found. Checked: \(paths.joined(separator: ", "))."
             case .scriptNotFound: return "Bundled llm-usage Node script was not found."
             case let .launchFailed(message): return "Could not start bundled Codex CLI: \(message)"
+            case let .commandFailed(message): return message
             case .timedOut: return "Bundled Codex CLI timed out."
             case let .malformed(details): return details.map { "Bundled Codex CLI returned malformed JSON: \($0)" } ?? "Bundled Codex CLI returned malformed JSON."
             }
         }
     }
 
-    func fetchPiAuth() async throws -> CodexSnapshot {
+    func fetchPiAuth(expectedAccountID: String) async throws -> CodexSnapshot {
         // The active managed account is deliberately handed to Pi. Do not add --codex-home here:
         // the bundled Node core must exercise Pi's locked OAuth storage and refresh path.
-        try await self.fetch(arguments: ["codex", "--json"])
+        try await self.fetch(arguments: ["codex", "--expected-account-id", expectedAccountID, "--json"])
     }
 
     func fetchManaged(codexHome: URL) async throws -> CodexSnapshot {
@@ -478,9 +489,20 @@ struct CodexNodeBridge: Sendable {
         if processControl.wasCancelled { throw CancellationError() }
         if timedOut { throw BridgeError.timedOut }
         guard process.terminationStatus == 0 else {
-            throw BridgeError.launchFailed(resultError.isEmpty ? "exit status \(process.terminationStatus)" : resultError)
+            throw Self.commandFailure(
+                stderr: resultError,
+                exitStatus: process.terminationStatus)
         }
         return (stdout.value(), resultError)
+    }
+
+    static func commandFailure(stderr: String, exitStatus: Int32) -> BridgeError {
+        if stderr == "Managed Codex account is not authenticated." ||
+            stderr == "Managed Codex auth.json is missing." {
+            return .commandFailed("Not signed in. Use Settings → Managed Codex accounts → Sign in again…")
+        }
+        let details = stderr.isEmpty ? "exit status \(exitStatus)" : stderr
+        return .commandFailed("Bundled Codex CLI command failed: \(details)")
     }
 
     private static func redact(_ text: String) -> String {
