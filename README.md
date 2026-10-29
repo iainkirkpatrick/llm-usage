@@ -46,7 +46,10 @@ Codex usage for agents and scripts is provided by the bundled Node CLI. The macO
 ```bash
 ./scripts/package-macos-app.sh
 ./dist/LLM\ Usage.app/Contents/MacOS/llm-usage codex --json
+./dist/LLM\ Usage.app/Contents/MacOS/llm-usage claude --json
 ```
+
+`claude --json` reports Claude Code's default login (or the directory selected by `CLAUDE_CONFIG_DIR`), reusing the app's Keychain-safe credential reader and quota fetcher. It never selects an LLM Usage app profile or refreshes Claude tokens. A private per-config cache and cross-process lock coalesce concurrent requests; recent failures are backed off. This command requires the packaged macOS app helper. To install the updated CLI, rebuild with `./scripts/package-macos-app.sh`, then run the dotfiles installer shown above (or use the launcher in `dist/LLM Usage.app` directly). The Linux installer remains Codex-only because it has no Swift/Keychain helper.
 
 On Linux, install the Node bundle and launcher (no Swift runtime is required):
 

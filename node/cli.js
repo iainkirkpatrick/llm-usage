@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { fetchUsage, fetchAllManagedUsage, consumeCredit, diagnose as diagnoseCodex, redactSensitive } from "./core.js";
 import { fileURLToPath } from "node:url";
+import { fetchClaudeUsage } from "./claude.js";
 
 function parseCodexHomeOption(args, index, values) {
   const value = args[++index];
@@ -40,6 +41,11 @@ function parseUsageOptions(args, start = 1) {
 
 export function parseArgs(args) {
   if (!args.length || ["help", "-h", "--help"].includes(args[0])) return { command: "help", json: false };
+  if (args[0] === "claude") {
+    for (const arg of args.slice(1)) if (arg !== "--json") throw new Error(`Unknown argument: ${arg}`);
+    if (!args.includes("--json")) throw new Error("Usage: llm-usage claude --json");
+    return { command: "claude", json: true };
+  }
   if (args[0] === "diagnose") {
     if (args.length > 2 || (args[1] && args[1] !== "--json")) throw new Error(`Unknown argument: ${args[1]}`);
     return { command: "diagnose", json: args[1] === "--json" };
@@ -67,12 +73,16 @@ export function parseArgs(args) {
 }
 
 export function help() {
-  return "Usage: llm-usage codex [--json] [--codex-home PATH | --all-managed | --expected-account-id ID]\n       llm-usage codex reset consume --credit-id ID --idempotency-key KEY --expected-account-id ID [--codex-home PATH] --json\n       llm-usage diagnose [--json]\n       llm-usage help";
+  return "Usage: llm-usage codex [--json] [--codex-home PATH | --all-managed | --expected-account-id ID]\n       llm-usage claude --json\n       llm-usage codex reset consume --credit-id ID --idempotency-key KEY --expected-account-id ID [--codex-home PATH] --json\n       llm-usage diagnose [--json]\n       llm-usage help";
 }
 
 async function main(argv = process.argv.slice(2)) {
   const parsed = parseArgs(argv);
   if (parsed.command === "help") { console.log(help()); return; }
+  if (parsed.command === "claude") {
+    const result = await fetchClaudeUsage();
+    console.log(JSON.stringify(result)); return;
+  }
   if (parsed.command === "diagnose") {
     const result = diagnoseCodex();
     const source = result.codex.source ?? "not queried";
