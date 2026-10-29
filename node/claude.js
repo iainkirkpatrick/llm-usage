@@ -16,7 +16,9 @@ function configIdentity(env, fingerprint) {
   const configured = env.CLAUDE_CONFIG_DIR;
   const directory = configured ? path.resolve(configured.replace(/^~/, home)) : path.join(home, ".claude");
   const mode = configured ? "explicit" : "default";
-  return { key: crypto.createHash("sha256").update(`${process.getuid?.() ?? "user"}\0${mode}\0${directory}\0${fingerprint}`).digest("hex") };
+  const scope = crypto.createHash("sha256").update(`${process.getuid?.() ?? "user"}\0${mode}\0${directory}`).digest("hex");
+  const key = crypto.createHash("sha256").update(`${scope}\0${fingerprint}`).digest("hex");
+  return { scope, key };
 }
 
 function secureDirectory(directory) {
@@ -106,27 +108,26 @@ function invokeHelper(executable, env, { identity = false, timeoutMs = HELPER_TI
 }
 
 export async function fetchClaudeUsage({ env = process.env, cacheDirectory = path.join(env.HOME || os.homedir(), ".llm-usage-bar", "claude-cli-cache"), executable = helperPath(env), now = Date.now, helperTimeoutMs = HELPER_TIMEOUT_MS } = {}) {
-  const fingerprint = await invokeHelper(executable, { ...env }, { identity: true, timeoutMs: helperTimeoutMs });
-  const { key } = configIdentity(env, fingerprint);
+  const { scope } = configIdentity(env, "");
   secureDirectory(cacheDirectory);
-  const cacheFile = path.join(cacheDirectory, `${key}.json`);
-  const lockFile = path.join(cacheDirectory, `${key}.lock`);
+  const lockFile = path.join(cacheDirectory, `${scope}.lock`);
+  const failureFile = path.join(cacheDirectory, `${scope}.identity.json`);
   let lock;
-  const deadline = now() + LOCK_TIMEOUT_MS;
+  // The owner may run both identity and quota helpers sequentially.
+  const coordinationTimeoutMs = Math.max(LOCK_TIMEOUT_MS, 2 * (helperTimeoutMs + 500) + 1_000);
+  const deadline = now() + coordinationTimeoutMs;
   while (!lock) {
     try {
       lock = fs.openSync(lockFile, "wx", 0o600);
       fs.writeFileSync(lock, String(process.pid));
       fs.fsyncSync(lock);
-    }
-    catch (error) {
+    } catch (error) {
       if (error.code !== "EEXIST") throw new Error("Could not coordinate Claude usage refresh safely.");
-      const prior = readCache(cacheFile);
-      if (prior?.result && now() - prior.savedAt < CACHE_TTL_MS) return validate(prior.result);
-      if (prior?.error && now() < prior.retryAt) throw new Error(prior.error);
+      const failure = readCache(failureFile);
+      if (failure?.error && now() < failure.retryAt) throw new Error(failure.error);
       try {
         const info = fs.statSync(lockFile);
-        if (now() - info.mtimeMs > LOCK_TIMEOUT_MS * 3) {
+        if (now() - info.mtimeMs > coordinationTimeoutMs * 3) {
           const pid = Number(fs.readFileSync(lockFile, "utf8"));
           let alive = true;
           try { process.kill(pid, 0); } catch (e) { if (e.code === "ESRCH") alive = false; }
@@ -138,11 +139,24 @@ export async function fetchClaudeUsage({ env = process.env, cacheDirectory = pat
     }
   }
   try {
+    const failure = readCache(failureFile);
+    if (failure?.error && now() < failure.retryAt) throw new Error(failure.error);
+    let fingerprint;
+    try {
+      fingerprint = await invokeHelper(executable, { ...env }, { identity: true, timeoutMs: helperTimeoutMs });
+      try { fs.unlinkSync(failureFile); } catch {}
+    } catch (error) {
+      const message = String(error?.message || "Claude credential identity is unavailable.").replace(/Bearer\s+\S+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]").slice(0, 500);
+      writeCache(failureFile, { savedAt: now(), retryAt: now() + FAILURE_BACKOFF_MS, error: message });
+      throw new Error(message);
+    }
+    const { key } = configIdentity(env, fingerprint);
+    const cacheFile = path.join(cacheDirectory, `${key}.json`);
     const current = readCache(cacheFile);
     if (current?.result && now() - current.savedAt < CACHE_TTL_MS) return validate(current.result);
     if (current?.error && now() < current.retryAt) throw new Error(current.error);
     try {
-      const result = await invokeHelper(executable, { ...env }, { timeoutMs: helperTimeoutMs });
+      const result = await invokeHelper(executable, { ...env, LLM_USAGE_CLAUDE_FINGERPRINT: fingerprint }, { timeoutMs: helperTimeoutMs });
       writeCache(cacheFile, { savedAt: now(), result });
       return result;
     } catch (error) {

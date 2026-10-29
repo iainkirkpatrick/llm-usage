@@ -89,6 +89,12 @@ enum ClaudeCredentials {
         return "Claude Code-credentials-" + digest.prefix(8)
     }
 
+    static func fingerprint(_ credential: ClaudeCredential, profile: ClaudeAccountProfile) -> String {
+        let tokenDigest = SHA256.hash(data: Data(credential.accessToken.utf8)).map { String(format: "%02x", $0) }.joined()
+        return SHA256.hash(data: Data((serviceName(for: profile) + "\0" + tokenDigest).utf8))
+            .map { String(format: "%02x", $0) }.joined()
+    }
+
     static func read(profile: ClaudeAccountProfile, allowKeychainPrompt: Bool = false) throws -> ClaudeCredential {
         try read(profile: profile, allowKeychainPrompt: allowKeychainPrompt, keychain: readKeychain)
     }
@@ -158,7 +164,9 @@ enum ClaudeCredentials {
             kSecUseAuthenticationContext as String: context,
         ]
         var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        let status = try KeychainAccess.withInteraction(allowed: interactive) {
+            SecItemCopyMatching(query as CFDictionary, &result)
+        }
         if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess, let data = result as? Data else {
             throw ClaudeBackendError.keychainUnavailable

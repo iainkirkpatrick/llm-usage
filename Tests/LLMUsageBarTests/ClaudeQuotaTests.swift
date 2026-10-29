@@ -113,6 +113,22 @@ final class ClaudeQuotaTests: XCTestCase {
         }
     }
 
+    func testQuotaHelperRejectsIdentityChangedBetweenHelperInvocations() async throws {
+        let profile = ClaudeAccountProfile(label: "Fixture")
+        let original = try Self.credential()
+        let changed = ClaudeCredential(accessToken: "different-account-token", expiresAt: original.expiresAt,
+                                       scopes: original.scopes, subscriptionType: nil, rateLimitTier: nil)
+        let fetcher = ClaudeUsageFetcher(transport: { _ in
+            XCTFail("Identity mismatch must fail before any provider request")
+            throw ClaudeBackendError.network
+        }, credentialReader: { _, _ in changed }, backoff: ClaudeQuotaBackoff())
+        do {
+            _ = try await fetcher.fetch(profile: profile,
+                                       expectedFingerprint: ClaudeCredentials.fingerprint(original, profile: profile))
+            XCTFail("A quota helper must not use a different account than its cache key")
+        } catch { XCTAssertEqual(error as? ClaudeBackendError, .credentialChanged) }
+    }
+
     func testOptionalMalformedWindowsAndSpendUnits() throws {
         let usage = try JSONSerialization.jsonObject(with: Data(#"{"five_hour":{"utilization":true},"seven_day":{"utilization":"20"},"seven_day_oauth_apps":{"utilization":45,"resets_at":"2026-08-01T00:00:00.123Z"},"seven_day_sonnet":{"utilization":101},"seven_day_opus":{"utilization":0},"extra_usage":{"is_enabled":true,"used_credits":1234,"monthly_limit":5000}}"#.utf8)) as! [String: Any]
         let snapshot = try ClaudeUsageFetcher.snapshot(usage: usage, accountID: Self.identity, email: nil, credential: Self.credential(), now: Date())

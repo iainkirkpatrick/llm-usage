@@ -73,7 +73,8 @@ struct ClaudeUsageFetcher: Sendable {
         return (data, response)
     }
 
-    func fetch(profile: ClaudeAccountProfile, allowKeychainPrompt: Bool = false) async throws -> ClaudeQuotaSnapshot {
+    func fetch(profile: ClaudeAccountProfile, allowKeychainPrompt: Bool = false,
+               expectedFingerprint: String? = nil) async throws -> ClaudeQuotaSnapshot {
         var keys = ["profile:" + ClaudeCredentials.serviceName(for: profile)]
         if let account = profile.accountID { keys.append("account:" + account) }
         try await backoff.check(keys, now: now())
@@ -83,6 +84,11 @@ struct ClaudeUsageFetcher: Sendable {
         catch let error as ClaudeBackendError { throw error }
         catch { throw ClaudeBackendError.credentialsInvalid }
         guard credential.expiresAt > now() else { throw ClaudeBackendError.credentialsExpired }
+        // Bind the quota helper to the identity observed by Node before its cache lookup.
+        if let expectedFingerprint,
+           ClaudeCredentials.fingerprint(credential, profile: profile) != expectedFingerprint {
+            throw ClaudeBackendError.credentialChanged
+        }
         if let scopes = credential.scopes, !scopes.contains("user:profile") { throw ClaudeBackendError.scopeMissing }
         let identity = try Self.identity(try await request("profile", credential: credential, keys: keys))
         if let expected = profile.accountID, expected != identity.id { throw ClaudeBackendError.identityMismatch }

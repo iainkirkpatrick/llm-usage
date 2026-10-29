@@ -273,7 +273,10 @@ struct OpenCodeCookieAutoImporter {
         ]
 
         var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        // Serialize with Claude's noninteractive reads: the legacy UI switch is process-wide.
+        let status = try? KeychainAccess.withInteraction(allowed: true) {
+            SecItemCopyMatching(query as CFDictionary, &item)
+        }
         guard status == errSecSuccess, let data = item as? Data else { return nil }
         return String(data: data, encoding: .utf8)
     }
