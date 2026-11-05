@@ -974,15 +974,48 @@ struct PiCodexCredentialHandoff: Sendable {
             throw PiCodexCredentialHandoffError.recoveryRequired("another handoff transaction is recorded")
         }
 
-        return try self.piAuthStore.withLockedDocument { document, piLock in
+        let targetHome = try self.managedHomeStore.prepareAccountHome(for: accountID)
+        let targetAuth = targetHome.appendingPathComponent("auth.json")
+        let targetAuthInfo = try AppOwnedPathSafety.info(at: targetAuth)
+        // Missing-native adoption must not create an empty Pi auth file as a side effect.
+        return try self.piAuthStore.withLockedDocument(createIfMissing: targetAuthInfo.exists) { document, piLock in
             try self.checkOwnership(appLock: appLock, piLock: piLock)
-            let targetHome = try self.managedHomeStore.prepareAccountHome(for: accountID)
-            let targetAuth = targetHome.appendingPathComponent("auth.json")
+            let currentTargetAuthInfo = try AppOwnedPathSafety.info(at: targetAuth)
+            guard currentTargetAuthInfo.exists == targetAuthInfo.exists else {
+                throw PiCodexCredentialHandoffError.concurrentChange(targetAuth.path)
+            }
+            let piCredential = try self.readPiCredential(document)
+            if !targetAuthInfo.exists {
+                guard config.codexPiHandoffAccountID == nil else {
+                    throw PiCodexCredentialHandoffError.managedCredentialMissing(targetAuth.path)
+                }
+                guard let expectedID = Self.normalizedAccountID(targetProfile.accountID) else {
+                    throw PiCodexCredentialHandoffError.handoffStateInvalid("the target profile has no ChatGPT account identity")
+                }
+                guard let piCredential else {
+                    throw PiCodexCredentialHandoffError.piCredentialMissing
+                }
+                guard piCredential.accountID == expectedID else {
+                    throw PiCodexCredentialHandoffError.piCredentialIdentityMismatch(
+                        expected: expectedID,
+                        actual: piCredential.accountID)
+                }
+                var adopted = config
+                try self.setProfileAccountID(accountID: accountID, accountIDValue: piCredential.accountID, in: &adopted)
+                adopted.codexPiHandoffAccountID = accountID
+                adopted.codexPrimaryAccountID = accountID
+                try self.checkOwnership(appLock: appLock, piLock: piLock)
+                guard !(try AppOwnedPathSafety.info(at: targetAuth)).exists else {
+                    throw PiCodexCredentialHandoffError.concurrentChange(targetAuth.path)
+                }
+                guard saveConfig(adopted) else { throw PiCodexCredentialHandoffError.configSaveFailed }
+                try self.checkOwnership(appLock: appLock, piLock: piLock)
+                return PiCodexHandoffResult(config: adopted, warning: nil)
+            }
             let targetNative = try self.readNativeCredential(
                 accountID: accountID,
                 profile: targetProfile,
                 authURL: targetAuth)
-            let piCredential = try self.readPiCredential(document)
             var next = config
             try self.setProfileAccountID(
                 accountID: accountID,
