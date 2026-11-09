@@ -49,6 +49,7 @@ final class ClaudeQuotaTests: XCTestCase {
         XCTAssertEqual(try Self.credential().subscriptionType, "max")
         for (json, expected) in [
             (#"{"claudeAiOauth":{"accessToken":"fixture","expiresAt":1}}"#, ClaudeBackendError.credentialsExpired),
+            (#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#, .credentialsCleared),
             (#"{"claudeAiOauth":{"accessToken":"fixture","expiresAt":4102444800000,"scopes":[]}}"#, .scopeMissing),
             (#"{"claudeAiOauth":{"accessToken":"fixture","expiresAt":true}}"#, .credentialsInvalid),
             (#"{"claudeAiOauth":{"accessToken":"fixture\nheader","expiresAt":4102444800000}}"#, .credentialsInvalid),

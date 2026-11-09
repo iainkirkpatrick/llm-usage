@@ -49,6 +49,8 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         self.refreshTask?.cancel()
+        ClaudeAuthRefreshCLI.stopAll()
+        ClaudeOwnerUsageProbe.stopAll()
         self.managedLoginTask?.cancel()
         self.claudeLoginTask?.cancel()
         self.piHandoffTask?.cancel()
@@ -84,8 +86,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func refreshAndUpdateMenu() async {
-        await self.state.refresh {
+    private func refreshAndUpdateMenu(forceClaude: Bool = false) async {
+        await self.state.refresh(forceClaude: forceClaude) {
             self.rebuildMenu()
         }
         await self.handleExpiringCodexResets()
@@ -428,9 +430,35 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         for account in accounts {
             menu.addItem(.separator())
-            let email = account.quota?.email ?? self.state.claudeAccounts.first(where: { $0.id == account.id })?.email
+            let profile = self.state.claudeAccounts.first(where: { $0.id == account.id })
+            let email = account.codeUsage?.identity.email ?? account.quota?.email ?? profile?.codeEmail ?? profile?.email
             menu.addItem(self.disabledItem(email.map { "\(account.label) — \($0)" } ?? account.label))
-            if let quota = account.quota {
+            if account.codeUsage == nil, self.state.currentConfig.claudeUsageSource == .claudeCode {
+                let source = account.quotaSource == .defaultClaudeCode ? "default login" : "configured profile"
+                menu.addItem(self.disabledItem("Source: Claude Code — \(source)"))
+            }
+            if let codeUsage = account.codeUsage {
+                let source = account.quotaSource == .defaultClaudeCode ? "default login" : "configured profile"
+                menu.addItem(self.disabledItem("Source: Claude Code — \(source)"))
+                func usageLine(_ title: String, _ window: ClaudeCLIUsageWindow?) -> NSMenuItem? {
+                    guard let window else { return nil }
+                    let remaining = Formatting.percent(100 - window.usedPercent)
+                    let reset = window.resetDescription.map { " (\($0))" } ?? ""
+                    return self.disabledItem("\(title) remaining: \(remaining)\(reset)")
+                }
+                if let item = usageLine("5h", codeUsage.usage.fiveHour) { menu.addItem(item) }
+                if let item = usageLine("Weekly", codeUsage.usage.weekly) { menu.addItem(item) }
+                for model in codeUsage.usage.modelWindows {
+                    if let item = usageLine("\(model.title) weekly", model.window) { menu.addItem(item) }
+                }
+                if let error = account.quotaError {
+                    menu.addItem(self.disabledItem("Last known reading — not refreshed"))
+                    menu.addItem(self.disabledItem("Refresh error: \(self.truncated(error, limit: 100))"))
+                }
+                menu.addItem(self.disabledItem("Last checked: \(Formatting.lastUpdated(codeUsage.capturedAt))"))
+                menu.addItem(self.disabledItem("Claude Code may return cached readings."))
+            } else if let quota = account.quota {
+                menu.addItem(self.disabledItem("Source: OAuth API — \(account.quotaSource.title)"))
                 if let fiveHour = quota.fiveHour {
                     menu.addItem(self.disabledItem("5h remaining: \(Formatting.percent(fiveHour.remainingPercent)) (resets in \(Formatting.relativeReset(fiveHour.resetAt)))"))
                 }
@@ -740,6 +768,25 @@ final class AppController: NSObject, NSApplicationDelegate {
             item.isEnabled = config.claudeEnabled && self.claudeLoginTask == nil && !self.state.isCodexAccountOperationInProgress
             claudeAccountsMenu.addItem(item)
         }
+        let usageSourceItem = NSMenuItem(title: "Usage source", action: nil, keyEquivalent: "")
+        let usageSourceMenu = NSMenu(title: "Usage source")
+        for (title, source) in [("Claude Code (recommended)", ClaudeUsageSource.claudeCode), ("OAuth API", ClaudeUsageSource.oauth)] {
+            let item = NSMenuItem(title: title, action: #selector(self.setClaudeUsageSource(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = source.rawValue
+            item.state = config.claudeUsageSource == source ? .on : .off
+            usageSourceMenu.addItem(item)
+        }
+        usageSourceItem.submenu = usageSourceMenu
+        claudeAccountsMenu.addItem(usageSourceItem)
+        let autoRefreshTitle = config.claudeUsageSource == .claudeCode
+            ? "Automatically refresh Claude Code usage…"
+            : "Automatically refresh expired Claude logins…"
+        let autoRefresh = NSMenuItem(title: autoRefreshTitle, action: #selector(self.toggleClaudeAutoRefresh), keyEquivalent: "")
+        autoRefresh.target = self
+        autoRefresh.state = config.claudeAutoRefreshEnabled ? .on : .off
+        autoRefresh.isEnabled = !self.state.isCodexAccountOperationInProgress && self.claudeLoginTask == nil
+        claudeAccountsMenu.addItem(autoRefresh)
         if self.claudeLoginTask != nil {
             let cancel = NSMenuItem(title: "Cancel sign-in", action: #selector(self.cancelClaudeLogin), keyEquivalent: "")
             cancel.target = self
@@ -754,7 +801,15 @@ final class AppController: NSObject, NSApplicationDelegate {
             signIn.representedObject = profile.id
             signIn.isEnabled = !self.state.isCodexAccountOperationInProgress && self.claudeLoginTask == nil
             accountMenu.addItem(signIn)
-            let refresh = NSMenuItem(title: "Refresh / allow Keychain access…", action: #selector(self.refreshClaudeAccount(_:)), keyEquivalent: "")
+            let usesDefault = self.state.snapshot.claudeAccounts.first(where: { $0.id == profile.id })?.quotaSource == .defaultClaudeCode
+            if usesDefault {
+                accountMenu.addItem(self.disabledItem("Quota uses the default Claude Code login"))
+            }
+            let usesClaudeCode = config.claudeUsageSource == .claudeCode
+            let refreshTitle = usesClaudeCode
+                ? (usesDefault ? "Refresh default Claude Code usage…" : "Refresh Claude Code usage…")
+                : (usesDefault ? "Refresh / allow default login Keychain access…" : "Refresh / allow Keychain access…")
+            let refresh = NSMenuItem(title: refreshTitle, action: #selector(self.refreshClaudeAccount(_:)), keyEquivalent: "")
             refresh.target = self
             refresh.representedObject = profile.id
             refresh.isEnabled = !self.state.isCodexAccountOperationInProgress && self.claudeLoginTask == nil
@@ -763,6 +818,10 @@ final class AppController: NSObject, NSApplicationDelegate {
             command.target = self
             command.representedObject = profile.id
             accountMenu.addItem(command)
+            let setupCommand = NSMenuItem(title: usesDefault ? "Copy default login refresh setup command" : "Copy refresh setup command", action: #selector(self.copyClaudeRefreshSetupCommand(_:)), keyEquivalent: "")
+            setupCommand.target = self
+            setupCommand.representedObject = profile.id
+            accountMenu.addItem(setupCommand)
             let remove = NSMenuItem(title: "Remove from tracking…", action: #selector(self.removeClaudeAccount(_:)), keyEquivalent: "")
             remove.target = self
             remove.representedObject = profile.id
@@ -971,7 +1030,7 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     @objc private func refreshNow() {
         Task { [weak self] in
-            await self?.refreshAndUpdateMenu()
+            await self?.refreshAndUpdateMenu(forceClaude: true)
         }
     }
 
@@ -1226,6 +1285,40 @@ final class AppController: NSObject, NSApplicationDelegate {
         self.applyConfigMutation { $0.claudeEnabled.toggle() }
     }
 
+    @objc private func setClaudeUsageSource(_ sender: NSMenuItem) {
+        guard let rawValue = sender.representedObject as? String,
+              let source = ClaudeUsageSource(rawValue: rawValue) else { return }
+        if source == .claudeCode, self.state.currentConfig.claudeUsageSource != .claudeCode,
+           self.state.currentConfig.claudeAutoRefreshEnabled {
+            let alert = NSAlert()
+            alert.messageText = "Use Claude Code for automatic usage checks?"
+            alert.informativeText = "LLM Usage will run Claude Code’s local /usage command for the matching login/profile. Claude Code manages its credentials and may show macOS Keychain prompts. Reported identity is email/organisation, not independently verified account UUIDs, and readings may be cached. No chat prompt is sent and no login or workspace-trust prompts are answered automatically."
+            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: "Use Claude Code")
+            NSRunningApplication.current.activate()
+            guard alert.runModal() == .alertSecondButtonReturn else { return }
+        }
+        self.applyConfigMutation { $0.claudeUsageSource = source }
+    }
+
+    @objc private func toggleClaudeAutoRefresh() {
+        if !self.state.currentConfig.claudeAutoRefreshEnabled {
+            let alert = NSAlert()
+            if self.state.currentConfig.claudeUsageSource == .claudeCode {
+                alert.messageText = "Allow automatic Claude Code usage refresh?"
+                alert.informativeText = "LLM Usage will run the owner CLI’s local /usage command for tracked profiles. This may trigger macOS Keychain access. It will not send a chat prompt, accept workspace-trust prompts, or sign you in. Claude Code may return cached readings; the source is the selected Claude Code login/profile."
+            } else {
+                alert.messageText = "Allow Claude Code to refresh expired logins in the background?"
+                alert.informativeText = "For each expired tracked profile, LLM Usage will briefly run Claude Code’s local /status command in an isolated directory. Claude Code owns all token refreshes; LLM Usage never copies or rotates refresh tokens. This may show macOS Keychain prompts. It will not send a chat prompt, accept workspace-trust prompts, or sign you in automatically. If setup is required, use the profile’s Copy refresh setup command and complete it once in your terminal."
+            }
+            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: "Allow background refresh")
+            NSRunningApplication.current.activate()
+            guard alert.runModal() == .alertSecondButtonReturn else { return }
+        }
+        self.applyConfigMutation { $0.claudeAutoRefreshEnabled.toggle() }
+    }
+
     @objc private func addClaudeAccount() {
         guard let label = self.promptForValue(title: "Add Claude account", message: "Create an isolated app-owned Claude profile, then sign in.", defaultValue: "Claude account \(self.state.claudeAccounts.count + 1)", placeholder: "Personal, work, …") else { return }
         do {
@@ -1305,10 +1398,44 @@ final class AppController: NSObject, NSApplicationDelegate {
         NSPasteboard.general.setString(command, forType: .string)
     }
 
+    @objc private func copyClaudeRefreshSetupCommand(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let profile = self.state.claudeQuotaSetupProfile(id: id) else { return }
+        do {
+            let directory = try ClaudeAuthRefreshCLI.prepareWorkspace(profile: profile)
+            guard let executable = ClaudeCLI.resolveExecutable(environment: ProcessInfo.processInfo.environment) else {
+                throw ClaudeBackendError.cliMissing
+            }
+            func quote(_ text: String) -> String { "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+            let profileEnvironment = profile.configDirectory == nil ? "" : " CLAUDE_CONFIG_DIR=" + quote(profile.directoryURL.path)
+            // A clean environment prevents the terminal's provider/token overrides
+            // from silently setting up the wrong login. Include no secret values.
+            let runtimePath = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+                .components(separatedBy: ":").filter { $0.hasPrefix("/") && !$0.contains(where: { $0.isNewline || $0 == "\0" }) }
+                .joined(separator: ":") + ":/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
+            let codeSource = self.state.currentConfig.claudeUsageSource == .claudeCode
+            let traffic = codeSource
+                ? " DISABLE_AUTOUPDATER=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1"
+                : " CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
+            let command = "cd " + quote(directory.path)
+                + " && env -i HOME=" + quote(FileManager.default.homeDirectoryForCurrentUser.path)
+                + " PATH=" + quote(runtimePath) + " TERM=xterm-256color" + traffic
+                + profileEnvironment + " " + quote(executable.path)
+                + " --tools '' --allowed-tools '' --strict-mcp-config --settings '{\"disableAllHooks\":true,\"remoteControlAtStartup\":false}' --no-chrome"
+                + (codeSource ? " --safe-mode /usage" : " /status")
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(command, forType: .string)
+        } catch {
+            self.showAlert(title: "Could not prepare Claude refresh setup", message: error.localizedDescription, style: .warning)
+        }
+    }
+
     @objc private func refreshClaudeAccount(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? UUID else { return }
         Task { [weak self] in
             guard let self else { return }
+            // This flag also marks an explicit user refresh. In Claude Code mode
+            // it forces the owner probe; it never enables an app Keychain reader.
             await self.state.refreshClaudeAccount(id: id, allowKeychainPrompt: true)
             self.rebuildMenu()
         }

@@ -123,8 +123,13 @@ final class AppState {
     private var piUsageObservation = PiCodexUsageObservation(accountID: nil, error: "Not checked yet")
     private(set) var isAuthenticatingClaudeAccount = false
     private(set) var authenticatingClaudeAccountID: UUID?
-    private let claudeFetcher = ClaudeUsageFetcher()
-    private let claudeSessionsFetcher = ClaudeSessionsFetcher()
+    private let claudeFetcher: ClaudeUsageFetcher
+    private let claudeCodeFetcher: any ClaudeCodeUsageFetching
+    private let configSaver: (AppConfig) -> Bool
+    private var claudeRevision = 0
+    private let claudeRecovery: ClaudeCredentialRecovery
+    private let claudeDefaultIdentityHint: @Sendable () -> String?
+    private let claudeSessionsReader: @Sendable (ClaudeAccountProfile) throws -> ClaudeLocalUsage
     private var isRedeemingCodexReset = false
     private var pendingCodexResetRedemption: PendingCodexResetRedemption?
     private var codexResetRefreshRequired = Set<String>()
@@ -143,6 +148,12 @@ final class AppState {
     init(
         config: AppConfig,
         codexFetcher: any CodexUsageFetching = CodexNodeBridge(),
+        claudeFetcher: ClaudeUsageFetcher = ClaudeUsageFetcher(),
+        claudeCodeFetcher: any ClaudeCodeUsageFetching = ClaudeCodeUsageFetcher(),
+        configSaver: @escaping (AppConfig) -> Bool = ConfigStore.save,
+        claudeSessionsReader: @escaping @Sendable (ClaudeAccountProfile) throws -> ClaudeLocalUsage = { try ClaudeSessionsFetcher().fetch(profile: $0) },
+        claudeRecovery: ClaudeCredentialRecovery = ClaudeCredentialRecovery(),
+        claudeDefaultIdentityHint: @escaping @Sendable () -> String? = { ClaudeDefaultIdentityHint.read() },
         piCodexHandoff: PiCodexCredentialHandoff = PiCodexCredentialHandoff(),
         pendingCodexResetURL: URL = ConfigStore.appDirectoryURL.appendingPathComponent("pending-codex-reset.json"),
         logInfo: @escaping (String) -> Void = AppLog.info,
@@ -152,6 +163,12 @@ final class AppState {
         self.logInfo = logInfo
         self.logError = logError
         self.codexFetcher = codexFetcher
+        self.claudeFetcher = claudeFetcher
+        self.claudeCodeFetcher = claudeCodeFetcher
+        self.configSaver = configSaver
+        self.claudeSessionsReader = claudeSessionsReader
+        self.claudeRecovery = claudeRecovery
+        self.claudeDefaultIdentityHint = claudeDefaultIdentityHint
         self.piCodexHandoff = piCodexHandoff
         self.managedHomeStore = piCodexHandoff.managedHomeStore
         self.pendingCodexResetStore = PendingCodexResetRedemptionStore(fileURL: pendingCodexResetURL)
@@ -225,13 +242,24 @@ final class AppState {
 
     @discardableResult
     func persistConfig(_ config: AppConfig) -> Bool {
-        guard ConfigStore.save(config) else { return false }
+        guard self.configSaver(config) else { return false }
+        let changed = self.config.claudeUsageSource != config.claudeUsageSource
+            || self.config.claudeEnabled != config.claudeEnabled
+            || self.config.claudeAccounts != config.claudeAccounts
         self.config = config
+        if changed {
+            self.claudeRevision += 1
+            self.applyClaudeAccountListToSnapshot(clearQuota: true)
+        }
         return true
     }
 
     func reloadConfig() {
+        let prior = self.config
         self.config = ConfigStore.load()
+        let changed = prior.claudeUsageSource != self.config.claudeUsageSource
+            || prior.claudeEnabled != self.config.claudeEnabled || prior.claudeAccounts != self.config.claudeAccounts
+        if changed { self.claudeRevision += 1 }
         self.normalizePrimaryCodexAccount()
         do {
             try self.piCodexHandoff.recoverIfNeeded(config: self.config)
@@ -241,7 +269,7 @@ final class AppState {
         }
         self.observePiAccount()
         self.applyPrimaryCodexSelectionToSnapshot()
-        self.applyClaudeAccountListToSnapshot()
+        self.applyClaudeAccountListToSnapshot(clearQuota: changed)
     }
 
     private func normalizePrimaryCodexAccount() {
@@ -710,7 +738,7 @@ final class AppState {
         }
     }
 
-    func refresh(onStart: () -> Void) async {
+    func refresh(forceClaude: Bool = false, onStart: () -> Void) async {
         guard !self.isRefreshing, !self.isRedeemingCodexReset, !self.isAuthenticatingClaudeAccount else { return }
         self.isRefreshing = true
         onStart()
@@ -769,11 +797,25 @@ final class AppState {
 
         var claudeAccounts: [ClaudeAccountSnapshot] = []
         if self.config.claudeEnabled {
-            for profile in self.config.claudeAccounts {
-                let account = await self.fetchClaudeAccount(profile: profile, allowKeychainPrompt: false)
-                claudeAccounts.append(account)
-                if let error = account.quotaError { errors.append("Claude \(profile.label): \(error)") }
-                if let error = account.localError { errors.append("Claude \(profile.label) local logs: \(error)") }
+            let revision = self.claudeRevision
+            let profiles = self.config.claudeUsageSource == .claudeCode
+                ? self.config.claudeAccounts.map(self.claudeCodeRoutingProfile) : self.config.claudeAccounts
+            if self.config.claudeUsageSource == .claudeCode {
+                let observation = await self.observeDefaultClaudeCodeIdentity(force: forceClaude)
+                for profile in profiles where self.claudeRevision == revision {
+                    claudeAccounts.append(await self.fetchClaudeCodeAccount(profile: profile, profiles: profiles,
+                        defaultObservation: observation, force: forceClaude, revision: revision))
+                }
+            } else {
+                let observation = await self.observeDefaultClaudeLogin()
+                for profile in profiles where self.claudeRevision == revision {
+                    claudeAccounts.append(await self.fetchClaudeAccount(profile: profile, allowKeychainPrompt: false, defaultObservation: observation))
+                }
+            }
+            if revision != self.claudeRevision { claudeAccounts = self.snapshot.claudeAccounts }
+            for account in claudeAccounts {
+                if let error = account.quotaError { errors.append("Claude \(account.label): \(error)") }
+                if let error = account.localError { errors.append("Claude \(account.label) local logs: \(error)") }
             }
         }
 
@@ -1034,6 +1076,7 @@ final class AppState {
         next.claudeAccounts.append(profile)
         guard ConfigStore.save(next) else { throw ClaudeProfileError.saveFailed }
         self.config = next
+        self.claudeRevision += 1
         self.applyClaudeAccountListToSnapshot()
         return profile
     }
@@ -1045,6 +1088,7 @@ final class AppState {
         next.claudeAccounts.removeAll { $0.id == id }
         guard ConfigStore.save(next) else { throw ClaudeProfileError.saveFailed }
         self.config = next
+        self.claudeRevision += 1
         // Never delete another application's settings, history, or Keychain item.
         self.applyClaudeAccountListToSnapshot()
     }
@@ -1071,21 +1115,196 @@ final class AppState {
               let profile = self.claudeAccounts.first(where: { $0.id == id }) else { return }
         self.isRefreshing = true
         defer { self.isRefreshing = false }
-        let result = await self.fetchClaudeAccount(profile: profile, allowKeychainPrompt: allowKeychainPrompt)
-        guard self.claudeAccounts.contains(where: { $0.id == id }) else { return }
+        let revision = self.claudeRevision
+        let result: ClaudeAccountSnapshot
+        if self.config.claudeUsageSource == .claudeCode {
+            let profiles = self.claudeAccounts.map(self.claudeCodeRoutingProfile)
+            let observation = await self.observeDefaultClaudeCodeIdentity(force: allowKeychainPrompt)
+            result = await self.fetchClaudeCodeAccount(profile: self.claudeCodeRoutingProfile(profile), profiles: profiles,
+                defaultObservation: observation, force: allowKeychainPrompt, revision: revision)
+        } else {
+            let observation = await self.observeDefaultClaudeLogin(promptFor: allowKeychainPrompt ? profile : nil)
+            result = await self.fetchClaudeAccount(profile: profile, allowKeychainPrompt: allowKeychainPrompt, defaultObservation: observation)
+        }
+        guard revision == self.claudeRevision, self.claudeAccounts.contains(where: { $0.id == id }) else { return }
         var accounts = self.snapshot.claudeAccounts.filter { $0.id != id }
         accounts.append(result)
         let order = self.claudeAccounts.map(\.id)
         self.replaceClaudeSnapshots(accounts.sorted { order.firstIndex(of: $0.id)! < order.firstIndex(of: $1.id)! })
     }
 
-    private func fetchClaudeAccount(profile: ClaudeAccountProfile, allowKeychainPrompt: Bool) async -> ClaudeAccountSnapshot {
-        let sessions = self.claudeSessionsFetcher
-        let localTask = Task.detached(priority: .utility) { try sessions.fetch(profile: profile) }
+    private func claudeCodeRoutingProfile(_ profile: ClaudeAccountProfile) -> ClaudeAccountProfile {
+        var result = profile
+        if result.email == nil, result.codeEmail == nil {
+            result.codeEmail = ClaudeDefaultIdentityHint.configuredEmail(profile: profile)
+        }
+        return result
+    }
+
+    private func observeDefaultClaudeCodeIdentity(force: Bool) async -> ClaudeCodeDefaultObservation {
+        guard !self.claudeAccounts.isEmpty, force || self.config.claudeAutoRefreshEnabled else {
+            return ClaudeCodeDefaultObservation(identity: nil, error: nil)
+        }
+        // Preserve logout/account errors so a cached usage result cannot override
+        // a newly observed signed-out default. Independent profiles remain usable.
+        do {
+            return ClaudeCodeDefaultObservation(identity: try await self.claudeCodeFetcher.identity(
+                profile: ClaudeAccountProfile(label: "Default Claude Code login")), error: nil)
+        } catch { return ClaudeCodeDefaultObservation(identity: nil, error: error) }
+    }
+
+    private func fetchClaudeCodeAccount(profile: ClaudeAccountProfile, profiles: [ClaudeAccountProfile],
+                                        defaultObservation: ClaudeCodeDefaultObservation, force: Bool,
+                                        revision: Int) async -> ClaudeAccountSnapshot {
+        let sessions = self.claudeSessionsReader
+        let localTask = Task.detached(priority: .utility) { try sessions(profile) }
+        let previous = self.snapshot.claudeAccounts.first(where: { $0.id == profile.id })
+        let defaultIdentity = defaultObservation.identity
+        var source = ClaudeCodeUsageRouting.source(for: profile, profiles: profiles, defaultIdentity: defaultIdentity)
+        var usage: ClaudeCodeUsageSnapshot?
+        var quotaError: String?
+        if !force && !self.config.claudeAutoRefreshEnabled {
+            quotaError = "Automatic Claude Code usage refresh is off. Choose Refresh Claude Code usage to check this profile."
+            if let prior = previous?.codeUsage, (try? ClaudeCodeUsageRouting.validate(prior.identity, for: profile)) != nil {
+                usage = prior
+                source = previous?.quotaSource ?? source
+            }
+        } else {
+            do {
+                try Task.checkCancellation()
+                guard revision == self.claudeRevision else { throw CancellationError() }
+                var owner = profile
+                if source == .defaultClaudeCode {
+                    guard let observed = defaultIdentity else {
+                        throw defaultObservation.error ?? ClaudeOwnerUsageProbeError.authUnavailable
+                    }
+                    try ClaudeCodeUsageRouting.validate(observed, for: profile)
+                    if let old = previous?.codeUsage,
+                       old.identity.email?.lowercased() != observed.email?.lowercased()
+                        || old.identity.organizationID?.lowercased() != observed.organizationID?.lowercased() {
+                        throw ClaudeBackendError.identityMismatch
+                    }
+                    owner.configDirectory = nil
+                }
+                // An observed ambient identity must not be paired with an older
+                // cached reading from a previous default login.
+                let reading = try await self.claudeCodeFetcher.fetch(profile: owner, force: force || source == .defaultClaudeCode)
+                try Task.checkCancellation()
+                guard revision == self.claudeRevision, self.config.claudeUsageSource == .claudeCode else { throw CancellationError() }
+                try ClaudeCodeUsageRouting.validate(reading.identity, for: profile)
+                if source == .defaultClaudeCode, let defaultIdentity, defaultIdentity != reading.identity {
+                    throw ClaudeOwnerUsageProbeError.identityChanged
+                }
+                if let old = previous?.codeUsage,
+                   old.identity.email?.lowercased() != reading.identity.email?.lowercased()
+                    || old.identity.organizationID?.lowercased() != reading.identity.organizationID?.lowercased() {
+                    throw ClaudeBackendError.identityMismatch
+                }
+                // Persist separate owner-reported pins only. Never invent an
+                // account UUID or modify the existing verified OAuth identity.
+                if let index = self.config.claudeAccounts.firstIndex(where: { $0.id == profile.id }) {
+                    var next = self.config
+                    if next.claudeAccounts[index].codeEmail == nil { next.claudeAccounts[index].codeEmail = reading.identity.email }
+                    if next.claudeAccounts[index].codeOrganizationID == nil {
+                        next.claudeAccounts[index].codeOrganizationID = reading.identity.organizationID?.lowercased()
+                    }
+                    if next != self.config {
+                        guard self.configSaver(next) else { throw ClaudeProfileError.saveFailed }
+                        self.config = next
+                    }
+                }
+                usage = reading
+                let session = reading.usage.fiveHour.map { String(100 - $0.usedPercent) } ?? "unavailable"
+                let weekly = reading.usage.weekly.map { String(100 - $0.usedPercent) } ?? "unavailable"
+                self.logInfo("Claude \(profile.label) capture via Claude Code (\(source.title)): sessionLeft=\(session) weeklyLeft=\(weekly)")
+            } catch {
+                quotaError = ClaudeCodeUsageRouting.diagnostic(error)
+                if ClaudeCodeUsageRouting.canRetainLastKnown(after: error), previous?.quotaSource == source,
+                   let prior = previous?.codeUsage,
+                   (try? ClaudeCodeUsageRouting.validate(prior.identity, for: profile)) != nil {
+                    usage = prior
+                }
+            }
+        }
+        var local: ClaudeLocalUsage?
+        var localError: String?
+        do { local = try await localTask.value } catch { localError = error.localizedDescription }
+        return ClaudeAccountSnapshot(id: profile.id, label: profile.label, quota: nil, localUsage: local,
+            quotaError: quotaError, localError: localError, quotaSource: source, codeUsage: usage)
+    }
+
+    private func observeDefaultClaudeLogin(promptFor target: ClaudeAccountProfile? = nil,
+                                           allowRecovery: Bool = true) async -> ClaudeDefaultQuotaObservation {
+        guard !self.claudeAccounts.isEmpty else {
+            return ClaudeDefaultQuotaObservation(quota: nil, error: ClaudeBackendError.credentialsMissing, identityHint: nil)
+        }
+        let hint = ClaudeDefaultIdentityHint.canonicalIdentity(self.claudeDefaultIdentityHint())
+        let matches = self.claudeAccounts.filter { hint != nil && ClaudeDefaultIdentityHint.canonicalIdentity($0.accountID) == hint }
+        let explicitlyTrackedUnpinned = self.claudeAccounts.contains { $0.configDirectory == nil && $0.accountID == nil }
+        let prompt = target.map { $0.configDirectory == nil || (matches.count == 1 && matches[0].id == $0.id) } ?? false
+        let mayRepair = allowRecovery && (prompt || (self.config.claudeAutoRefreshEnabled && (matches.count == 1 || explicitlyTrackedUnpinned)))
+        var source = ClaudeAccountProfile(label: "Default Claude Code login")
+        do {
+            let quota: ClaudeQuotaSnapshot
+            do {
+                quota = try await self.claudeFetcher.fetch(profile: source, allowKeychainPrompt: prompt)
+            } catch ClaudeBackendError.credentialsExpired where mayRepair {
+                // The hint authorizes only a repair attempt, never quota attribution.
+                // Pin the subsequent authenticated fetch so a concurrent account switch
+                // cannot adopt another subscription under a previously observed identity.
+                if let target, target.configDirectory == nil {
+                    source.accountID = ClaudeDefaultIdentityHint.canonicalIdentity(target.accountID) ?? hint
+                } else {
+                    source.accountID = hint
+                }
+                try await self.claudeRecovery.recover(profile: source)
+                try Task.checkCancellation()
+                quota = try await self.claudeFetcher.fetch(profile: source, allowKeychainPrompt: prompt)
+            }
+            return ClaudeDefaultQuotaObservation(quota: quota, error: nil, identityHint: hint)
+        } catch {
+            return ClaudeDefaultQuotaObservation(quota: nil, error: error, identityHint: hint)
+        }
+    }
+
+    private func fetchClaudeAccount(profile: ClaudeAccountProfile, allowKeychainPrompt: Bool,
+                                   defaultObservation: ClaudeDefaultQuotaObservation) async -> ClaudeAccountSnapshot {
+        let revision = self.claudeRevision
+        let sessions = self.claudeSessionsReader
+        let localTask = Task.detached(priority: .utility) { try sessions(profile) }
         var quota: ClaudeQuotaSnapshot?
         var quotaError: String?
+        var quotaSource: ClaudeQuotaCredentialSource = .configuredProfile
         do {
-            quota = try await self.claudeFetcher.fetch(profile: profile, allowKeychainPrompt: allowKeychainPrompt)
+            switch ClaudeQuotaRouting.source(for: profile, profiles: self.claudeAccounts, observation: defaultObservation) {
+            case .defaultClaudeCode:
+                quotaSource = .defaultClaudeCode
+                quota = try self.verifiedDefaultQuota(for: profile, observation: defaultObservation)
+            case let .unavailable(error):
+                throw error
+            case .configuredProfile:
+                do {
+                    quota = try await self.claudeFetcher.fetch(profile: profile, allowKeychainPrompt: allowKeychainPrompt)
+                } catch ClaudeBackendError.credentialsExpired where allowKeychainPrompt || self.config.claudeAutoRefreshEnabled {
+                    // The default login may have switched during earlier accounts' work.
+                    // Re-observe at the mutation boundary, without repairing another login.
+                    let current = await self.observeDefaultClaudeLogin(allowRecovery: false)
+                    switch ClaudeQuotaRouting.source(for: profile, profiles: self.claudeAccounts, observation: current) {
+                    case .defaultClaudeCode:
+                        quotaSource = .defaultClaudeCode
+                        quota = try self.verifiedDefaultQuota(for: profile, observation: current)
+                    case let .unavailable(error):
+                        throw error
+                    case .configuredProfile(allowRecovery: false):
+                        throw ClaudeQuotaRoutingError.defaultIdentityUnknown
+                    case .configuredProfile(allowRecovery: true):
+                        try await self.claudeRecovery.recover(profile: profile)
+                        try Task.checkCancellation()
+                        quota = try await self.claudeFetcher.fetch(profile: profile, allowKeychainPrompt: allowKeychainPrompt)
+                    }
+                }
+            }
+            guard revision == self.claudeRevision, self.config.claudeUsageSource == .oauth else { throw CancellationError() }
             if let quota, let index = self.config.claudeAccounts.firstIndex(where: { $0.id == profile.id }),
                self.config.claudeAccounts[index].accountID != quota.accountID || self.config.claudeAccounts[index].email != quota.email {
                 var next = self.config
@@ -1100,14 +1319,35 @@ final class AppState {
         do { local = try await localTask.value }
         catch { localError = error.localizedDescription }
         return ClaudeAccountSnapshot(id: profile.id, label: profile.label, quota: quota, localUsage: local,
-                                     quotaError: quotaError, localError: localError)
+                                     quotaError: quotaError, localError: localError, quotaSource: quotaSource)
     }
 
-    private func applyClaudeAccountListToSnapshot() {
+    private func verifiedDefaultQuota(for profile: ClaudeAccountProfile,
+                                      observation: ClaudeDefaultQuotaObservation) throws -> ClaudeQuotaSnapshot {
+        guard let quota = observation.quota else { throw observation.error ?? ClaudeBackendError.credentialsMissing }
+        if let expected = profile.accountID,
+           ClaudeDefaultIdentityHint.canonicalIdentity(expected) != quota.accountID {
+            throw ClaudeBackendError.identityMismatch
+        }
+        return quota
+    }
+
+    /// Setup must approve the same workspace/login that quota recovery will use.
+    /// Ordinary launch/sign-in actions remain scoped to the configured local profile.
+    func claudeQuotaSetupProfile(id: UUID) -> ClaudeAccountProfile? {
+        guard var profile = self.claudeAccounts.first(where: { $0.id == id }) else { return nil }
+        if self.snapshot.claudeAccounts.first(where: { $0.id == id })?.quotaSource == .defaultClaudeCode {
+            profile.configDirectory = nil
+        }
+        return profile
+    }
+
+    private func applyClaudeAccountListToSnapshot(clearQuota: Bool = false) {
         let existing = self.snapshot.claudeAccounts
         self.replaceClaudeSnapshots(self.claudeAccounts.map { profile in
-            existing.first(where: { $0.id == profile.id }) ?? ClaudeAccountSnapshot(
-                id: profile.id, label: profile.label, quota: nil, localUsage: nil, quotaError: nil, localError: nil)
+            if !clearQuota, let prior = existing.first(where: { $0.id == profile.id }) { return prior }
+            return ClaudeAccountSnapshot(id: profile.id, label: profile.label, quota: nil,
+                localUsage: existing.first(where: { $0.id == profile.id })?.localUsage, quotaError: nil, localError: nil)
         })
     }
 

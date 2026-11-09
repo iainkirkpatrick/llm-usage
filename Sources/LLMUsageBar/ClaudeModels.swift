@@ -8,15 +8,22 @@ struct ClaudeAccountProfile: Codable, Equatable, Sendable {
     var configDirectory: String?
     var accountID: String?
     var email: String?
+    // Owner-reported CLI association pins, not authenticated account UUIDs.
+    // Kept separate so CLI observations never rewrite verified OAuth identity.
+    var codeEmail: String?
+    var codeOrganizationID: String?
     let createdAt: Date
 
     init(id: UUID = UUID(), label: String, configDirectory: String? = nil,
-         accountID: String? = nil, email: String? = nil, createdAt: Date = Date()) {
+         accountID: String? = nil, email: String? = nil, codeEmail: String? = nil,
+         codeOrganizationID: String? = nil, createdAt: Date = Date()) {
         self.id = id
         self.label = label
         self.configDirectory = configDirectory
         self.accountID = accountID
         self.email = email
+        self.codeEmail = codeEmail
+        self.codeOrganizationID = codeOrganizationID
         self.createdAt = createdAt
     }
 
@@ -37,6 +44,22 @@ struct ClaudeNamedRateWindow: Sendable {
 struct ClaudeExtraUsage: Sendable {
     let usedUSD: Double?
     let limitUSD: Double?
+}
+
+struct ClaudeCodeUsageSnapshot: Sendable {
+    let identity: ClaudeOwnerAuthObservation
+    let usage: ClaudeCLIUsageReading
+    let capturedAt: Date
+
+    init(identity: ClaudeOwnerAuthObservation, usage: ClaudeCLIUsageReading, capturedAt: Date) {
+        self.identity = identity
+        self.usage = usage
+        self.capturedAt = capturedAt
+    }
+
+    init(result: ClaudeOwnerUsageProbeResult) {
+        self.init(identity: result.ownerReportedIdentity, usage: result.usage, capturedAt: result.capturedAt)
+    }
 }
 
 struct ClaudeQuotaSnapshot: Sendable {
@@ -100,4 +123,6 @@ struct ClaudeAccountSnapshot: Sendable {
     let localUsage: ClaudeLocalUsage?
     let quotaError: String?
     let localError: String?
+    var quotaSource: ClaudeQuotaCredentialSource = .configuredProfile
+    var codeUsage: ClaudeCodeUsageSnapshot? = nil
 }

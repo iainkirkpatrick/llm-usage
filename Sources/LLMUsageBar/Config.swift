@@ -1,6 +1,13 @@
 import Darwin
 import Foundation
 
+enum ClaudeUsageSource: String, Codable, Sendable, CaseIterable {
+    case claudeCode
+    case oauth
+
+    var title: String { self == .claudeCode ? "Claude Code" : "OAuth API" }
+}
+
 struct CodexManagedAccountProfile: Codable, Sendable, Equatable {
     let id: UUID
     var label: String
@@ -57,6 +64,8 @@ struct AppConfig: Codable, Equatable, Sendable {
     var refreshIntervalSeconds: Int
     var codexEnabled: Bool
     var claudeEnabled: Bool
+    var claudeUsageSource: ClaudeUsageSource
+    var claudeAutoRefreshEnabled: Bool
     var claudeAccounts: [ClaudeAccountProfile]
     var openCodeEnabled: Bool
     var openCodeWorkspaceID: String?
@@ -76,6 +85,7 @@ struct AppConfig: Codable, Equatable, Sendable {
         refreshIntervalSeconds: 300,
         codexEnabled: true,
         claudeEnabled: true,
+        claudeUsageSource: .claudeCode,
         claudeAccounts: [],
         openCodeEnabled: true,
         openCodeWorkspaceID: nil,
@@ -93,6 +103,8 @@ struct AppConfig: Codable, Equatable, Sendable {
         refreshIntervalSeconds: Int,
         codexEnabled: Bool,
         claudeEnabled: Bool = true,
+        claudeUsageSource: ClaudeUsageSource = .claudeCode,
+        claudeAutoRefreshEnabled: Bool = true,
         claudeAccounts: [ClaudeAccountProfile] = [],
         openCodeEnabled: Bool,
         openCodeWorkspaceID: String?,
@@ -108,6 +120,8 @@ struct AppConfig: Codable, Equatable, Sendable {
         self.refreshIntervalSeconds = refreshIntervalSeconds
         self.codexEnabled = codexEnabled
         self.claudeEnabled = claudeEnabled
+        self.claudeUsageSource = claudeUsageSource
+        self.claudeAutoRefreshEnabled = claudeAutoRefreshEnabled
         self.claudeAccounts = claudeAccounts
         self.openCodeEnabled = openCodeEnabled
         self.openCodeWorkspaceID = openCodeWorkspaceID
@@ -125,6 +139,8 @@ struct AppConfig: Codable, Equatable, Sendable {
         case refreshIntervalSeconds
         case codexEnabled
         case claudeEnabled
+        case claudeUsageSource
+        case claudeAutoRefreshEnabled
         case claudeAccounts
         case openCodeEnabled
         case openCodeWorkspaceID
@@ -145,6 +161,8 @@ struct AppConfig: Codable, Equatable, Sendable {
         self.refreshIntervalSeconds = try container.decodeIfPresent(Int.self, forKey: .refreshIntervalSeconds) ?? defaults.refreshIntervalSeconds
         self.codexEnabled = try container.decodeIfPresent(Bool.self, forKey: .codexEnabled) ?? defaults.codexEnabled
         self.claudeEnabled = try container.decodeIfPresent(Bool.self, forKey: .claudeEnabled) ?? defaults.claudeEnabled
+        self.claudeUsageSource = try container.decodeIfPresent(ClaudeUsageSource.self, forKey: .claudeUsageSource) ?? .oauth
+        self.claudeAutoRefreshEnabled = try container.decodeIfPresent(Bool.self, forKey: .claudeAutoRefreshEnabled) ?? defaults.claudeAutoRefreshEnabled
         self.claudeAccounts = try container.decodeIfPresent([ClaudeAccountProfile].self, forKey: .claudeAccounts) ?? defaults.claudeAccounts
         self.openCodeEnabled = try container.decodeIfPresent(Bool.self, forKey: .openCodeEnabled) ?? defaults.openCodeEnabled
         self.openCodeWorkspaceID = try container.decodeIfPresent(String.self, forKey: .openCodeWorkspaceID)

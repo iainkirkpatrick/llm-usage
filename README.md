@@ -49,7 +49,9 @@ Codex usage for agents and scripts is provided by the bundled Node CLI. The macO
 ./dist/LLM\ Usage.app/Contents/MacOS/llm-usage claude --json
 ```
 
-`claude --json` reports Claude Code's default login (or the directory selected by `CLAUDE_CONFIG_DIR`), reusing the app's Keychain-safe credential reader and quota fetcher. It never selects an LLM Usage app profile or refreshes Claude tokens. A private per-config cache and cross-process lock coalesce concurrent requests; recent failures are backed off. This command requires the packaged macOS app helper. To install the updated CLI, rebuild with `./scripts/package-macos-app.sh`, then run the dotfiles installer shown above (or use the launcher in `dist/LLM Usage.app` directly). The Linux installer remains Codex-only because it has no Swift/Keychain helper.
+`claude --json` reports the caller's default login or exact `CLAUDE_CONFIG_DIR`; it never substitutes a tracked app account. It follows **Settings → Claude accounts → Usage source**. With **Claude Code**, the packaged helper asks the owner CLI for structured usage (`initialize` then `get_usage`, no model/user messages), checking reported email/organization before and after. This path does not read credentials from Keychain and preserves `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, including when inherited from Pi. OAuth API remains available explicitly and retains its existing credential/UUID checks.
+
+The JSON keeps `claude.session`, `claude.weekly`, `remainingPercent`, `resetAt`, and `source`. For Claude Code, `updatedAt` is a compatibility alias of `capturedAt`; `freshnessVerified` and `identityVerifiedForTrackedAccount` are false. Capture time is not the original measurement time. The structured control API is experimental; incompatible responses fail closed rather than triggering login or falling back to another account/source. A private 60-second cache/backoff and cross-process lock coalesce requests, with reported identity rechecked even on cache hits. The total request budget is 25 seconds plus at most one second for process cleanup, below Pi's default 30-second timeout. This command requires the packaged macOS helper. Rebuild with `./scripts/package-macos-app.sh`, then run the dotfiles installer shown above (or use the launcher in `dist/LLM Usage.app` directly). The Linux installer remains Codex-only.
 
 On Linux, install the Node bundle and launcher (no Swift runtime is required):
 
@@ -94,6 +96,8 @@ Example:
   "autoRedeemExpiringCodexResets" : false,
   "codexEnabled" : true,
   "claudeEnabled" : true,
+  "defaultClaudeCode" : true,
+  "claudeAutoRefreshEnabled" : true,
   "claudeAccounts" : [],
   "codexManagedAccounts" : [],
   "codexPrimaryAccountID" : null,
@@ -155,11 +159,15 @@ Use **Settings → Claude accounts**:
 - **Track existing Claude profile…** registers another directory already used with `CLAUDE_CONFIG_DIR`. Select the configuration directory itself, not its `projects` subdirectory.
 - **Add Claude account…** creates an isolated directory under `~/.llm-usage-bar/claude-accounts/<profile-id>/` and runs the installed `claude auth login --claudeai` for that directory. Sign in to the desired subscription in the browser. This does not switch your normal/default Claude Code login.
 
-Each tracked profile shows its available five-hour, weekly, and model-specific remaining percentages and reset times. Extra-usage spend and its reported cap are shown when available. Quota is fetched using that profile's OAuth credential through Claude's **undocumented/internal** usage and profile endpoints; these may change without notice. Missing windows stay unavailable rather than becoming synthetic 0% usage. One account's failure does not hide the others.
+Each tracked profile shows available five-hour, weekly, and model-specific usage windows and reset times. The OAuth API source additionally shows extra-usage spend/cap when available. Under **Settings → Claude accounts → Usage source**, choose **Claude Code (recommended)** or **OAuth API**. A fresh configuration defaults to Claude Code; a pre-existing configuration without `claudeUsageSource` remains on OAuth API until the user explicitly selects a source. Missing windows remain unavailable, and one profile's failure does not hide the others.
 
-Credentials remain owned by Claude Code, in the profile-specific macOS Keychain item or `.credentials.json`; LLM Usage stores only labels, directory paths, and verified account/organization identity metadata. Custom directories never fall back to the default account's Keychain entry. The unset/default profile is distinct from explicitly setting `CLAUDE_CONFIG_DIR=~/.claude`, even though both use the same log directory; a log directory can only be tracked once. Conflicting valid file/Keychain logins fail closed rather than silently choosing an old account. If a profile's authenticated account changes, remove and re-add its tracking entry to acknowledge the new identity.
+**Claude Code source** runs the isolated owner CLI's `/usage` command, with auth status checked before and after. It runs in safe mode with tools, hooks, MCP, Chrome, and Remote Control disabled; telemetry, updater, and error reporting are narrowly disabled. LLM Usage does not read app Keychain credentials or tokens, refresh credentials, or answer OTP, login, or trust prompts on this path. Claude Code itself may refresh credentials or show macOS prompts. The setting **Automatically refresh Claude Code usage…** (`claudeAutoRefreshEnabled`) controls background CLI checks: when false, no background CLI runs; an explicit manual refresh forces a run past cache/backoff. `/usage` may return cached figures, so CLI capture time is not proof of measurement freshness.
 
-Background refreshes **never prompt for Keychain access**. Legacy login-Keychain authorization dialogs are suppressed with a serialized process-wide interaction gate, in addition to the LocalAuthentication context. The Claude CLI acquires a per-config cross-process lock before reading credentials, backs off identity failures for 60 seconds, and binds quota requests to the credential fingerprint used for caching. Use a profile's **Refresh / allow Keychain access…** action to grant it explicitly. Denied/locked access remains an error, not a reason to silently use an unverified source. Tokens are never copied to a second credential store, and **LLM Usage does not refresh Claude OAuth tokens**. When access expires, open that same profile in Claude Code so Claude Code can refresh its login, or use **Sign in…**. Each account's settings menu offers **Copy Claude Code launch command**, for example:
+CLI readings use the separate `codeUsage` result and are not treated as verified OAuth UUID measurements. Claude Code reports email and organization; LLM Usage pins these as `codeEmail` and `codeOrganizationID` without changing the existing verified `accountID` or `email` fields. The default login is used only when both its reported organization and an expected email uniquely match a tracked profile. Missing email associations can be bootstrapped from that configured profile’s historical `.claude.json` only when its complete UUID pair matches the saved identity; organization alone is insufficient. Unknown or ambiguous identities are never adopted, and a failure to read the default login does not block independent configured profiles. Menus identify **Default login** or **Configured profile** and show the actual reported email. A source switch clears incompatible results and discards stale in-flight results. Results are shared/coalesced with a 60-second cache/backoff per source; a newly observed default identity forces a capture rather than trusting an old cached login; manual force refreshes join an already-running request. Transient errors retain an in-memory last-known result only for the same origin, with a warning and original capture time; identity change or logout clears it. Shutdown cleans up probe processes.
+
+**OAuth API source** retains the existing OAuth credential reader, internal usage/profile API features, and authenticated account/organization UUID checks. Its fallback to the default login is still gated on an exact UUID match to one uniquely tracked subscription. LLM Usage does not copy tokens to another credential store or refresh OAuth tokens itself. The standalone `llm-usage claude --json` helper is unchanged: it remains a read-only OAuth API query of the default login or `CLAUDE_CONFIG_DIR`, independent of the app's selected usage source. Local session totals are unchanged and continue to come only from each configured profile's `projects/**/*.jsonl` history.
+
+For one-time CLI setup, **Copy refresh setup command** targets the actual selected origin (default login or configured profile) and runs `/usage` in safe mode with the narrow safety flags; complete any prompts yourself. **Sign in…** continues to target the configured profile. The normal **Copy Claude Code launch command** remains available, for example:
 
 ```bash
 CLAUDE_CONFIG_DIR="$HOME/.llm-usage-bar/claude-accounts/<profile-id>" claude
@@ -174,6 +182,10 @@ Removing a Claude account from tracking deletes only its tracking metadata, neve
 Node must be discoverable from common paths, your login shell, or `LLM_BAR_NODE_PATH`.
 
 Runtime refresh logs are written to `~/.llm-usage-bar/app.log`.
+
+### Claude Code usage source
+
+The Claude Code `/usage` source is now integrated into menu-bar polling as an explicitly selectable source; it is not the OAuth API transport and does not claim OAuth UUID verification or guaranteed measurement freshness. The CLI owner probe and its research history, including unresolved diagnostic identity/freshness flags, are documented in [the probe notes](docs/claude-owner-usage-probe.md).
 
 ### Pi setup
 

@@ -6,7 +6,7 @@ import Security
 
 /// Intentionally contains no provider text, paths, tokens, or CLI output.
 enum ClaudeBackendError: Error, LocalizedError, Equatable, Sendable {
-    case credentialsMissing, credentialsInvalid, credentialsExpired, scopeMissing, unsafeCredentialFile
+    case credentialsMissing, credentialsInvalid, credentialsCleared, credentialsExpired, scopeMissing, unsafeCredentialFile
     case keychainUnavailable, credentialStoresConflict, identityMissing, identityMismatch, credentialChanged
     case unauthorized, forbidden, rateLimited, backoff, network, invalidResponse, quotaMissing
     case cliMissing, cliLaunchFailed, cliFailed, loginTimedOut
@@ -15,7 +15,8 @@ enum ClaudeBackendError: Error, LocalizedError, Equatable, Sendable {
         switch self {
         case .credentialsMissing: return "No Claude Code login found. Sign in with Claude Code for this profile."
         case .credentialsInvalid: return "Claude Code credentials are invalid. Sign in again with Claude Code."
-        case .credentialsExpired: return "Open this profile in Claude Code to refresh its login, or sign in again. LLM Usage never refreshes Claude tokens."
+        case .credentialsCleared: return "Sign-in required: Claude Code cleared this profile’s rejected login. Automatic expiry refresh cannot restore it."
+        case .credentialsExpired: return "Claude Code login expired. Choose Refresh / allow Keychain access to ask Claude Code to refresh it, or open/sign in to this profile."
         case .scopeMissing: return "Claude Code login lacks user:profile permission. Sign in again with Claude Code."
         case .unsafeCredentialFile: return "Claude Code credential file is unsafe or too large. Use a regular credential file and sign in again."
         case .keychainUnavailable: return "Claude Code Keychain credentials are unavailable. Choose Refresh / allow Keychain access, or unlock your Keychain."
@@ -48,8 +49,13 @@ struct ClaudeCredential: Sendable {
     static func parse(_ data: Data, now: Date = Date()) throws -> Self {
         guard data.count <= ClaudeCredentials.maximumFileSize,
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = root["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String,
+              let oauth = root["claudeAiOauth"] as? [String: Any]
+        else { throw ClaudeBackendError.credentialsInvalid }
+        if oauth["accessToken"] as? String == "", oauth["refreshToken"] as? String == "",
+           ClaudeJSON.number(oauth["expiresAt"]) == 0 {
+            throw ClaudeBackendError.credentialsCleared
+        }
+        guard let token = oauth["accessToken"] as? String,
               !token.isEmpty, token.utf8.count <= 64 * 1024,
               !token.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0) }),
               let milliseconds = ClaudeJSON.number(oauth["expiresAt"]), milliseconds > 0
