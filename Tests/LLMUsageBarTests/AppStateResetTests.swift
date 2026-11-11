@@ -138,6 +138,57 @@ final class AppStateResetTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.pendingURL.path))
     }
 
+    func testObservedButUnmanagedPiAccountShowsOwnershipReasonNotRefreshAdvice() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        try fixture.writePi()
+        let state = fixture.state(fetcher: StubCodexFetcher())
+        await state.refresh(onStart: {})
+        XCTAssertNotNil(state.snapshot.codexAccounts.first?.usage)
+        XCTAssertFalse(state.canRedeemCodexResets(for: fixture.accountKey))
+        XCTAssertEqual(state.codexResetDisabledReason(for: fixture.accountKey),
+                       "Manage this active Pi account before spending its saved resets.")
+    }
+
+    func testResetReasonMatchesRefreshingMissingDataAndReadyStates() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let state = fixture.state(fetcher: StubCodexFetcher())
+        XCTAssertTrue(state.codexResetDisabledReason(for: fixture.accountKey)?.contains("no current usage data") == true)
+        await state.refresh(onStart: {
+            XCTAssertTrue(state.codexResetDisabledReason(for: fixture.accountKey)?.contains("refreshing") == true)
+            XCTAssertFalse(state.canRedeemCodexResets(for: fixture.accountKey))
+        })
+        XCTAssertNil(state.codexResetDisabledReason(for: fixture.accountKey))
+        XCTAssertTrue(state.canRedeemCodexResets(for: fixture.accountKey))
+        XCTAssertTrue(state.codexResetDisabledReason(for: UUID().uuidString)?.contains("no longer managed") == true)
+    }
+
+    func testRefreshAdviceIsReservedForFailedPostRedemptionRefresh() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let fetcher = StubCodexFetcher(onNativeFetch: { count in
+            if count == 3 { throw CodexNodeBridge.BridgeError.timedOut }
+        })
+        let state = fixture.state(fetcher: fetcher)
+        await state.refresh(onStart: {})
+        let result = try await state.consumeCodexResetCredit(accountID: fixture.accountKey, creditID: "reset-1")
+        XCTAssertNotNil(result.refreshError)
+        XCTAssertEqual(state.codexResetDisabledReason(for: fixture.accountKey),
+                       "Refresh this Codex account successfully before using another reset.")
+        await state.refresh(onStart: {})
+        XCTAssertNil(state.codexResetDisabledReason(for: fixture.accountKey))
+    }
+
+    func testStaleHandoffShowsItsOwnReason() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let state = fixture.state(fetcher: StubCodexFetcher(), ownedByPi: true)
+        await state.refresh(onStart: {})
+        XCTAssertEqual(state.codexResetDisabledReason(for: fixture.accountKey),
+                       "Clear the stale Pi handoff before spending saved resets.")
+    }
+
     func testPersistenceFailureNeverDispatchesReset() async throws {
         let fixture = try Fixture()
         defer { fixture.remove() }

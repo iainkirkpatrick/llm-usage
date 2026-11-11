@@ -306,20 +306,31 @@ final class AppState {
     }
 
     func canRedeemCodexResets(for accountID: String) -> Bool {
-        // Read-only observation must never authorize spending through a stale native copy.
+        self.codexResetDisabledReason(for: accountID) == nil
+    }
+
+    /// One gate for both eligibility and menu explanations; observation alone cannot authorize spending.
+    func codexResetDisabledReason(for accountID: String) -> String? {
         guard let id = UUID(uuidString: accountID),
-              let profile = self.managedCodexAccounts.first(where: { $0.id == id }) else { return false }
-        if case .unavailable = self.piUsageObservation.spendingSource(
-            for: profile, profiles: self.managedCodexAccounts, recordedHandoff: self.piHandoffAccountID) { return false }
-        guard !self.codexResetRefreshRequired.contains(accountID),
-              !self.isRefreshing,
-              !self.isRedeemingCodexReset,
-              self.snapshot.codexAccounts.contains(where: { $0.id == accountID && $0.usage != nil })
-        else { return false }
-        if let pending = self.pendingCodexResetRedemption {
-            return pending.accountID == accountID
+              let profile = self.managedCodexAccounts.first(where: { $0.id == id }) else {
+            return "This Codex account is no longer managed by LLM Usage."
         }
-        return true
+        if case let .unavailable(message) = self.piUsageObservation.spendingSource(
+            for: profile, profiles: self.managedCodexAccounts, recordedHandoff: self.piHandoffAccountID) {
+            return message
+        }
+        if self.isRefreshing { return "Codex usage is refreshing. Wait for it to finish, then try again." }
+        if self.isRedeemingCodexReset { return "A saved reset is already being redeemed. Wait for it to finish." }
+        if self.codexResetRefreshRequired.contains(accountID) {
+            return "Refresh this Codex account successfully before using another reset."
+        }
+        guard self.snapshot.codexAccounts.contains(where: { $0.id == accountID && $0.usage != nil }) else {
+            return "This Codex account has no current usage data. Refresh it before using a saved reset."
+        }
+        if let pending = self.pendingCodexResetRedemption, pending.accountID != accountID {
+            return "Resolve the pending saved-reset request on the other Codex account first."
+        }
+        return nil
     }
 
     func pendingCodexResetCreditID(for accountID: String) -> String? {

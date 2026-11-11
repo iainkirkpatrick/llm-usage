@@ -149,7 +149,7 @@ If the menu reports a stale handoff:
 3. To resume managed switching, choose **Manage this active Pi account…** for the account Pi actually uses. Exit Pi sessions before a credential handoff, as above.
 4. Select **Use for menu-bar glyph** if you want a different account displayed in the menu bar.
 
-Saved-reset spending is disabled while handoff ownership is inconsistent, and an observed-but-not-managed Pi account cannot spend resets through a stale native home. Inactive accounts with independent working credentials remain readable.
+Saved-reset spending is disabled while handoff ownership is inconsistent, and an observed-but-not-managed Pi account cannot spend resets through a stale native home. Disabled reset menus explain the actual condition: manage the active Pi account, clear a stale handoff, wait for an operation, resolve a pending request, or refresh unavailable usage. Refresh advice is not shown in place of missing credential ownership. Inactive accounts with independent working credentials remain readable.
 
 ### Claude setup and multiple subscriptions
 

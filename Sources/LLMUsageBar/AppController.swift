@@ -346,6 +346,9 @@ final class AppController: NSObject, NSApplicationDelegate {
             retry.representedObject = CodexResetSelection(accountID: account.id, creditID: pendingCreditID)
             retry.isEnabled = self.state.canRedeemCodexReset(accountID: account.id, creditID: pendingCreditID)
             menu.addItem(retry)
+            if !retry.isEnabled, let reason = self.state.codexResetDisabledReason(for: account.id) {
+                menu.addItem(self.disabledItem(reason))
+            }
         }
 
         if let resetCredits = codex.resetCredits {
@@ -376,7 +379,8 @@ final class AppController: NSObject, NSApplicationDelegate {
                 }
             } else {
                 resetMenu.addItem(.separator())
-                resetMenu.addItem(self.disabledItem("Refresh this Codex account successfully before using another reset."))
+                resetMenu.addItem(self.disabledItem(self.state.codexResetDisabledReason(for: account.id)
+                    ?? "Saved resets are temporarily unavailable."))
             }
 
             resetItem.submenu = resetMenu
